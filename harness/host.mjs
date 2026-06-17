@@ -333,9 +333,13 @@ async function hostService(request) {
   return new MfResponse("not found", { status: 404 });
 }
 
-export async function createHarness({ verboseLog = false } = {}) {
+export async function createHarness({ verboseLog = false, port, host } = {}) {
   const mf = new Miniflare({
     log: new Log(verboseLog ? LogLevel.DEBUG : LogLevel.INFO),
+    // When `port` is given, workerd listens on a real socket so a browser can
+    // hit the in-isolate vite dev server directly (run-dev.mjs). Omitted for
+    // the build/verify scripts, which talk to the isolate via dispatchFetch.
+    ...(port != null ? { port, host: host ?? "127.0.0.1" } : {}),
     modules: [
       { type: "ESModule", path: "worker/driver.mjs" },
       { type: "CompiledWasm", path: "worker/rolldown.wasm" },

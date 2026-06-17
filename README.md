@@ -24,17 +24,27 @@ and `@apply`), **react-router 7** and **@tanstack/react-query 5**.
 ## Quick start
 
 ```bash
-./setup.sh           # installs app + harness deps, builds the host baseline,
-                     # and patches Rolldown for single-threaded workerd
+./setup.sh    # installs app + harness deps, patches Rolldown for single-threaded workerd
 
 cd harness
-npm run verify       # vite build INSIDE workerd, byte-compared to the host build
-npm run dev          # vite dev server INSIDE workerd, crawled like a browser
-npm run build        # vite build INSIDE workerd, prints dist files + timing
+npm run dev    # vite dev server INSIDE workerd → open http://localhost:5173 in a browser
+npm run build  # vite build INSIDE workerd → writes ../app/dist
 ```
 
-`setup.sh` is just: `npm install && npx vite build` in `app/`, then
-`npm install` in `harness/` (whose `postinstall` runs `patch-emnapi-wasi.mjs`).
+`npm run dev` and `npm run build` behave like ordinary `vite` / `vite build` —
+the toolchain just runs inside the isolate instead of on Node. `dev` leaves
+workerd listening on a real port; open it and use the app like any Vite dev
+server (HMR client connects over `/__hmr`). Set `PORT=…` to change the port.
+
+Two extra scripts prove the isolate output matches Node:
+
+```bash
+npm run verify:build  # builds on host AND in workerd, byte-compares the two dist trees
+npm run verify:dev    # crawls the dev module graph and reports every response status
+```
+
+`setup.sh` is just `npm install` in `app/`, then `npm install` in `harness/`
+(whose `postinstall` runs `patch-emnapi-wasi.mjs`).
 
 ## How it works
 
@@ -102,7 +112,10 @@ harness/
   rolldown-shim/            patched @rolldown/browser loader (installed as node_modules/rolldown)
   shims/                    in-heap memfs fs / fs-promises, esbuild-wasm shim, bash
   patch-emnapi-wasi.mjs     reproducible JS-side patches for single-threaded workerd
-  run-{verify,dev-graph,build}.mjs
+  run-dev.mjs               `npm run dev`   — browser-accessible dev server on a real port
+  run-build.mjs             `npm run build` — build, written to ../app/dist
+  run-verify-build.mjs      `npm run verify:build` — host vs workerd byte-compare
+  run-verify-dev.mjs        `npm run verify:dev`   — dev module-graph crawl
 docs/rolldown-fork-findings.md
 ```
 

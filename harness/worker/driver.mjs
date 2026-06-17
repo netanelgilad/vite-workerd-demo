@@ -387,7 +387,16 @@ export default {
           rootResolved: server.config.root,
         });
       }
-      if (url.pathname.startsWith("/preview")) {
+      if (url.pathname === "/mem") {
+        return Response.json(typeof process.memoryUsage === "function" ? process.memoryUsage() : { unavailable: true });
+      }
+      // Browser-facing dev server. Any path that isn't a control op above is
+      // forwarded to vite's connect middleware running inside the isolate, so a
+      // browser can hit workerd's port directly (http://127.0.0.1:5173) and use
+      // the app exactly like a normal vite dev server. The legacy `/preview/*`
+      // prefix (used by the verify:dev crawl) is stripped; everything else is
+      // passed through verbatim. The HMR client connects to `/__hmr`.
+      {
         await ensureVfs(env);
         if (request.headers.get("Upgrade") === "websocket") {
           const pair = new WebSocketPair();
@@ -421,16 +430,12 @@ export default {
           return new Response(null, { status: 101, webSocket: client });
         }
         const server = await ensureDevServer();
-        const inner = new Request(
-          new URL((url.pathname.slice("/preview".length) || "/") + url.search, "http://vite.local"),
-          request
-        );
+        const pathname = url.pathname.startsWith("/preview")
+          ? (url.pathname.slice("/preview".length) || "/")
+          : url.pathname;
+        const inner = new Request(new URL(pathname + url.search, "http://vite.local"), request);
         return await dispatchToConnect(server.middlewares, inner);
       }
-      if (url.pathname === "/mem") {
-        return Response.json(typeof process.memoryUsage === "function" ? process.memoryUsage() : { unavailable: true });
-      }
-      return new Response("ops: /populate /build /dev/start /preview/* /mem", { status: 404 });
     } catch (e) {
       return Response.json({ ok: false, error: String(e), stack: e?.stack ?? null }, { status: 500 });
     }
