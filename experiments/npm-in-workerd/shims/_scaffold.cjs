@@ -1,0 +1,10 @@
+const fs = require('node:fs');
+const proc = require('node:process');
+const [name, template] = proc.argv.slice(2);
+const dir = '/tmp/' + name;
+fs.mkdirSync(dir + '/src', { recursive: true });
+fs.writeFileSync(dir + '/package.json', JSON.stringify({ name, template, type: 'module' }, null, 2));
+fs.writeFileSync(dir + '/src/main.tsx', '// ' + template + ' entry\n');
+console.log('Scaffolding project ' + name + ' with template ' + template + '...');
+console.log('Done.');
+proc.exit(0);

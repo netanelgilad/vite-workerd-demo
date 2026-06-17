@@ -124,6 +124,40 @@ export default {
         return Response.json({ ok: true, keys: Object.keys(m).slice(0, 8), default: typeof m.default });
       }
 
+      if (url.pathname === "/spawn-demo") {
+        // Proof: run a node program in-isolate the way a shimmed child_process
+        // spawn would — fake argv/exit, capture stdout, share the memfs. This is
+        // exactly the create-vite scaffolding mechanism (a node bin writing files).
+        const argv = (url.searchParams.get("argv") ?? "my-app,react-ts").split(",");
+        const file = "/tmp/shims/_scaffold.cjs";
+
+        const stdout = [];
+        const realExit = process.exit, realArgv = process.argv;
+        const realLog = console.log, realWrite = process.stdout?.write;
+        const ExitSignal = Symbol("exit");
+        let exitCode = 0;
+        process.exit = (c) => { exitCode = c ?? 0; throw ExitSignal; };
+        console.log = (...a) => stdout.push(a.join(" "));
+        if (process.stdout) process.stdout.write = (s) => (stdout.push(String(s)), true);
+        process.argv = ["node", file, ...argv];
+        try {
+          await import(file); // the "child" runs here, in this isolate
+        } catch (e) {
+          if (e !== ExitSignal) { exitCode = 1; stdout.push("ERR " + (e?.message ?? e)); }
+        } finally {
+          process.exit = realExit; process.argv = realArgv; console.log = realLog;
+          if (process.stdout && realWrite) process.stdout.write = realWrite;
+        }
+
+        // show what the "child" wrote into the shared memfs
+        const fs = await getFs();
+        const proj = "/tmp/" + argv[0];
+        let tree = [];
+        const walk = (d) => { for (const e of fs.readdirSync(d)) { const p = d + "/" + e; tree.push(p); try { if (fs.statSync(p).isDirectory()) walk(p); } catch {} } };
+        try { walk(proj); } catch {}
+        return Response.json({ ok: true, exitCode, stdout, wroteToMemfs: tree });
+      }
+
       if (url.pathname === "/ls") {
         const fs = await getFs();
         const p = url.searchParams.get("p") ?? "/tmp/proj";

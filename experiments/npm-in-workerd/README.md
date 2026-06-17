@@ -70,6 +70,52 @@ workerd stubs process spawning (`spawn` → "not implemented"). That means:
   vite` in-isolate, the scaffolder has to be run **in-process** (import its
   module) rather than spawned.
 
+## Spawning (`npm create vite`, lifecycle scripts) without a real `spawn`
+
+What npm actually spawns (confirmed by reading `@npmcli/run-script` +
+`create-vite`): a **shell** (`make-spawn-args` returns `{shell: true}`), and the
+shell runs the real commands — almost always **`node <bin>`** or a
+`node_modules/.bin/<tool>` shim (which is `node <tool>.js`). `create-vite@9` is a
+single bundled ESM `node` program. So the spawn tree is **shell → node**, and
+both layers can be shimmed in-isolate:
+
+1. **Shell layer → just-bash.** `spawn('sh', ['-c', script])` / `{shell:true}`
+   routes to just-bash (already used by the Vite harness for `npm run`): it parses
+   the command line (pipes, `&&`, redirects, env, globs) and runs builtins over
+   memfs, dispatching external commands through a hook.
+2. **Node layer → an in-isolate node runner** (proven in `/spawn-demo`): fake
+   `process.argv`/`cwd`/`env`, trap `process.exit` (throw a sentinel so it
+   doesn't kill the isolate), capture stdout/stderr, run the entry in *this*
+   isolate over the shared memfs. just-bash's external-command hook calls this
+   when it sees `node x.js` or a `.bin/<tool>`.
+
+So **just-bash helps with the shell layer but isn't sufficient on its own** — it's
+a shell, not a node runtime; the node runner is the other half, and they compose.
+
+### The real obstacle: executing memfs-resident code
+
+`/spawn-demo` runs a program **on disk** (servable by the host module-fallback).
+But a package npm installs lands in **memfs**, and workerd can't `import()`
+memfs modules — the fallback runs on the host and can't see the isolate's memfs.
+To run npm-installed node programs we need an **in-isolate loader**. The clean
+build reuses what we already run in-isolate: **bundle the target to one CJS
+string with rolldown/esbuild-wasm (reading memfs), then execute it via
+`UnsafeEval`** with a tiny CommonJS runtime (module/exports/require→builtins+memfs).
+`create-vite` being a single bundled ESM makes it a quick esbuild ESM→CJS
+transform + eval; it then copies its template dirs (already in memfs from the
+install) to the target — no real `spawn` anywhere.
+
+### What genuinely can't be shimmed
+- **Native binaries** — `node-gyp`/`make`/`python`/`prebuild-install` building or
+  downloading platform binaries (esbuild's own binary, etc.). No OS process. (The
+  Vite harness already replaces native bundlers with wasm, so the vite path is
+  unaffected.)
+- **True process isolation** — shared globals/module cache; we fake per-run
+  process state, fine for sequential scaffold/build steps, not concurrent ones.
+- **TTY / interactive prompts** — no TTY, so scaffolders must run fully
+  non-interactively (all flags) or be fed stdin.
+- **fork/IPC, signals, arbitrary system tools.**
+
 ## Toward the goal (`npm create vite` → `npm install` → `vite dev`)
 
 - ✅ `npm install` (the engine) runs in workerd — proven here.
