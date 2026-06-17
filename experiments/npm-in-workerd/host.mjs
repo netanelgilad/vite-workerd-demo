@@ -1,0 +1,241 @@
+// Host harness for running real npm inside workerd. Same idea as the vite
+// harness: a miniflare module-fallback service resolves the worker's imports
+// against npm's code on disk, rewrites fs imports to the in-heap memfs shim,
+// and routes runtime eval/Function/wasm through the UnsafeEval binding. npm's
+// network (node:https) reaches the real registry directly — no proxy.
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { init as cjsLexerInit, parse as cjsLexer } from "cjs-module-lexer";
+import enhancedResolve from "enhanced-resolve";
+
+await cjsLexerInit();
+import { Log, LogLevel, Miniflare, Response as MfResponse } from "miniflare";
+
+const HARNESS_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+const MOUNTS = [
+  { virt: "/tmp/xnm", host: path.join(HARNESS_DIR, "node_modules") },
+  { virt: "/tmp/shims", host: path.join(HARNESS_DIR, "shims") },
+];
+export function virt2host(p) {
+  for (const m of MOUNTS) if (p === m.virt || p.startsWith(m.virt + "/")) return m.host + p.slice(m.virt.length);
+  return null;
+}
+export function host2virt(p) {
+  for (const m of MOUNTS) if (p === m.host || p.startsWith(m.host + "/")) return m.virt + p.slice(m.host.length);
+  return null;
+}
+
+const importResolver = enhancedResolve.create.sync({
+  conditionNames: ["node", "import", "default"],
+  extensions: [".js", ".mjs", ".cjs", ".json"],
+  mainFields: ["module", "main"],
+});
+const requireResolver = enhancedResolve.create.sync({
+  conditionNames: ["node", "require", "default"],
+  extensions: [".js", ".cjs", ".json"],
+  mainFields: ["main"],
+});
+
+const ALIASES = {
+  fsevents: "404",
+  // npm's keepalive/proxy agent breaks node:https.request in workerd; swap it
+  // for one that returns no agent (workerd's default request works).
+  "@npmcli/agent": path.join(HARNESS_DIR, "shims/npmcli-agent.cjs"),
+};
+
+function pkgTypeIsModule(file) {
+  let dir = path.dirname(file);
+  while (dir.length > 1) {
+    const pj = path.join(dir, "package.json");
+    if (existsSync(pj)) {
+      try { return JSON.parse(readFileSync(pj, "utf8")).type === "module"; } catch { return false; }
+    }
+    dir = path.dirname(dir);
+  }
+  return false;
+}
+
+function rewriteSource(src, virtPath, format) {
+  src = src.replace(/(?<!["'`\\])\bimport\.meta\.url\b(?!["'`])/g, JSON.stringify("file://" + virtPath));
+  src = src.replace(/(?<!["'`\\])\bimport\.meta\.dirname\b(?!["'`])/g, JSON.stringify(path.dirname(virtPath)));
+  src = src.replace(/(?<!["'`\\])\bimport\.meta\.filename\b(?!["'`])/g, JSON.stringify(virtPath));
+  if (format === "cjs") {
+    src = `const __filename = ${JSON.stringify(virtPath)}, __dirname = ${JSON.stringify(path.dirname(virtPath))};\n` + src;
+  }
+  src = src.replaceAll("new WebAssembly.Module(", "globalThis.__UNSAFE_EVAL.newWasmModule(");
+  src = src.replaceAll("WebAssembly.compile(", "globalThis.__wasmCompile(");
+  src = src.replaceAll("(0,eval)", "(globalThis.__safeEval)");
+  src = src.replaceAll("(0, eval)", "(globalThis.__safeEval)");
+  src = src.replaceAll("new Function(", "globalThis.__newFunction(");
+  // route fs import/require sites to the in-heap memfs shim (incl. __require interop)
+  const importSite = (spec) =>
+    new RegExp(String.raw`(\bfrom\s*|\bimport\s*\(\s*|\b__require\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)(["'])${spec.replace(/[/\\]/g, "\\$&")}\2`, "gm");
+  for (const [spec, target] of [
+    ["node:fs/promises", "/tmp/shims/fs-promises.mjs"],
+    ["node:fs", "/tmp/shims/fs.mjs"],
+    ["fs/promises", "/tmp/shims/fs-promises.mjs"],
+    ["fs", "/tmp/shims/fs.mjs"],
+    // require('node:process') through workerd's CJS loader segfaults; rewrite
+    // the specifier so workerd never sees it — the shim re-exports the global.
+    ["node:process", "/tmp/shims/process.cjs"],
+    ["process", "/tmp/shims/process.cjs"],
+  ]) {
+    src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
+  }
+  return src;
+}
+
+const served = new Map();
+let fallbackCount = 0;
+
+export function moduleFallback(request) {
+  fallbackCount++;
+  const url = new URL(request.url);
+  const method = request.headers.get("X-Resolve-Method") ?? "import";
+  const specifier = url.searchParams.get("specifier") ?? "";
+  const rawSpecifier = url.searchParams.get("rawSpecifier") ?? specifier;
+  const referrer = url.searchParams.get("referrer") ?? "";
+  const verbose = process.env.FALLBACK_VERBOSE === "1";
+  if (verbose) console.log(`[fallback] ${method} raw=${rawSpecifier} spec=${specifier} ref=${referrer}`);
+
+  try {
+    if (rawSpecifier === "fs" || rawSpecifier === "node:fs") {
+      return new MfResponse(null, { status: 301, headers: { Location: "/tmp/shims/fs.mjs" } });
+    }
+    if (rawSpecifier === "fs/promises" || rawSpecifier === "node:fs/promises") {
+      return new MfResponse(null, { status: 301, headers: { Location: "/tmp/shims/fs-promises.mjs" } });
+    }
+    // node: builtins (workerd resolves them natively). Handle both bare
+    // (`process`) and prefixed (`node:process`) forms — npm uses the prefix.
+    const builtinName = rawSpecifier.startsWith("node:") ? rawSpecifier.slice(5) : rawSpecifier;
+    // `require('node:process')` through the fallback segfaults workerd (a
+    // workerd bug); the global `process` is fine. Route it to a shim that
+    // re-exports the global instead of the native module.
+    if (builtinName === "process") {
+      return new MfResponse(null, { status: 301, headers: { Location: "/tmp/shims/process.cjs" } });
+    }
+    if (/^(path|url|util|os|module|crypto|events|stream|buffer|assert|zlib|querystring|http|https|http2|net|tls|child_process|worker_threads|perf_hooks|readline|tty|v8|vm|string_decoder|constants|async_hooks|dns|inspector|timers|punycode|diagnostics_channel|sys|wasi)(\/|$)/.test(builtinName)) {
+      return new MfResponse(null, { status: 301, headers: { Location: "node:" + builtinName } });
+    }
+
+    let hostResolved;
+    const isBare = !rawSpecifier.startsWith("./") && !rawSpecifier.startsWith("../") && !rawSpecifier.startsWith("/");
+    if (rawSpecifier.startsWith("#")) {
+      const refHost = virt2host(referrer);
+      if (!refHost) return new MfResponse("hash specifier outside mounts", { status: 404 });
+      hostResolved = resolveFrom(path.dirname(refHost), rawSpecifier, method);
+    } else if (isBare) {
+      const baseName = rawSpecifier.split("/")[0].startsWith("@") ? rawSpecifier.split("/").slice(0, 2).join("/") : rawSpecifier.split("/")[0];
+      if (ALIASES[baseName] === "404") return new MfResponse("not found", { status: 404 });
+      if (ALIASES[baseName]) {
+        const rest = rawSpecifier.slice(baseName.length);
+        const aliasBase = ALIASES[baseName];
+        hostResolved = path.isAbsolute(aliasBase) ? aliasBase : resolveFrom(HARNESS_DIR, aliasBase + rest, method);
+      } else {
+        const refHost = virt2host(referrer) ?? path.join(HARNESS_DIR, "package.json");
+        try {
+          hostResolved = resolveFrom(path.dirname(refHost), rawSpecifier, method);
+        } catch (e) {
+          hostResolved = resolveFrom(HARNESS_DIR, rawSpecifier, method);
+        }
+      }
+    } else {
+      const hostPath = virt2host(specifier);
+      if (!hostPath) return new MfResponse("outside mounts: " + specifier, { status: 404 });
+      hostResolved = resolveExact(hostPath, method);
+    }
+
+    if (!hostResolved) return new MfResponse("unresolved: " + rawSpecifier, { status: 404 });
+    const virtResolved = host2virt(hostResolved);
+    if (!virtResolved) return new MfResponse("resolved outside mounts: " + hostResolved, { status: 404 });
+
+    if (virtResolved !== specifier) {
+      return new MfResponse(null, { status: 301, headers: { Location: virtResolved } });
+    }
+
+    const ext = path.extname(hostResolved);
+    if (ext === ".json") {
+      const raw = readFileSync(hostResolved, "utf8");
+      let named = [];
+      try { named = Object.keys(JSON.parse(raw)).filter((k) => /^[A-Za-z_$][\w$]*$/.test(k)); } catch {}
+      const body = JSON.stringify({ name: specifier.slice(1), commonJsModule: "module.exports = " + raw + ";", namedExports: named });
+      return new MfResponse(body, { headers: { "content-type": "application/json" } });
+    }
+    if (ext === ".wasm" || ext === ".node") {
+      return new MfResponse("binary modules not served as modules", { status: 404 });
+    }
+    let src = readFileSync(hostResolved, "utf8");
+    let format;
+    if (ext === ".mjs") format = "esm";
+    else if (ext === ".cjs") format = "cjs";
+    else if (pkgTypeIsModule(hostResolved)) format = "esm";
+    else if (/^\s*(export\s+(default|const|let|var|function|class|\{|\*)|import[\s{"'])/m.test(src) && !/(?<![.\w$])(module\.exports|exports\.[A-Za-z_$])/.test(src)) format = "esm";
+    else format = "cjs";
+    src = rewriteSource(src, virtResolved, format);
+    served.set(virtResolved, src.length);
+    let mod;
+    if (format === "esm") mod = { esModule: src };
+    else {
+      let named = [];
+      if (virtResolved === "/tmp/shims/process.cjs") {
+        // `module.exports = globalThis.process` has no static exports; list the
+        // process properties so `import { env } from "node:process"` works.
+        named = ["env", "argv", "argv0", "platform", "arch", "version", "versions",
+          "cwd", "chdir", "nextTick", "hrtime", "exit", "exitCode", "pid", "ppid",
+          "release", "features", "config", "execPath", "execArgv", "on", "once",
+          "off", "emit", "emitWarning", "removeListener", "stdout", "stderr", "stdin",
+          "kill", "umask", "uptime", "memoryUsage", "title", "report", "getBuiltinModule",
+          "allowedNodeEnvironmentFlags", "throwDeprecation", "noDeprecation", "hrtimeBigInt"];
+      } else {
+        try {
+          const lexed = cjsLexer(src);
+          named = [...lexed.exports];
+          for (const re of lexed.reexports) {
+            try {
+              const reHost = resolveFrom(path.dirname(hostResolved), re, "require");
+              named.push(...cjsLexer(readFileSync(reHost, "utf8")).exports);
+            } catch {}
+          }
+        } catch {}
+      }
+      named = [...new Set(named)].filter((n) => /^[A-Za-z_$][\w$]*$/.test(n) && n !== "default");
+      mod = { commonJsModule: src, namedExports: named };
+    }
+    const body = JSON.stringify({ name: specifier.replace(/^\//, ""), ...mod });
+    return new MfResponse(body, { headers: { "content-type": "application/json" } });
+  } catch (e) {
+    if (verbose || process.env.FALLBACK_ERRORS !== "0") console.log(`[fallback] ERROR ${rawSpecifier} from ${referrer}: ${e.message}`);
+    return new MfResponse(String(e), { status: 404 });
+  }
+}
+
+function resolveFrom(dir, spec, method) {
+  const r = method === "require" ? requireResolver : importResolver;
+  try { return r(dir, spec); } catch (e) {
+    const alt = method === "require" ? importResolver : requireResolver;
+    return alt(dir, spec);
+  }
+}
+
+function resolveExact(hostPath, method) {
+  if (existsSync(hostPath) && statSync(hostPath).isFile()) return hostPath;
+  return resolveFrom(path.dirname(hostPath), "./" + path.basename(hostPath), method);
+}
+
+export async function createHarness({ verboseLog = false } = {}) {
+  const mf = new Miniflare({
+    log: new Log(verboseLog ? LogLevel.DEBUG : LogLevel.INFO),
+    modules: [{ type: "ESModule", path: "worker/driver.mjs" }],
+    modulesRoot: ".",
+    compatibilityDate: "2026-06-01",
+    compatibilityFlags: ["nodejs_compat", "experimental"],
+    unsafeEvalBinding: "UNSAFE_EVAL",
+    unsafeUseModuleFallbackService: true,
+    unsafeModuleFallbackService: moduleFallback,
+  });
+  return { mf, stats: () => ({ fallbackCount, servedModules: served.size }) };
+}

@@ -1,0 +1,10 @@
+import { createHarness } from "./host.mjs";
+const pkg = process.argv[2] ?? "left-pad@1.3.0";
+const { mf, stats } = await createHarness({ verboseLog: false });
+const t0 = Date.now();
+const res = await mf.dispatchFetch("http://localhost/install?pkg=" + encodeURIComponent(pkg));
+const json = await res.json().catch(async () => ({ raw: await res.text() }));
+console.log("HTTP", res.status, "| wall ms:", Date.now() - t0);
+console.log(JSON.stringify(json, null, 2));
+console.log("fallback stats:", JSON.stringify(stats()));
+await mf.dispose();

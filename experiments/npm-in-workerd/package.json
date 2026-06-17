@@ -1,0 +1,13 @@
+{
+  "name": "npm-in-workerd",
+  "private": true,
+  "type": "module",
+  "description": "Spike: run real npm's install engine inside workerd over memfs",
+  "dependencies": {
+    "cjs-module-lexer": "^2.2.0",
+    "enhanced-resolve": "^5.24.0",
+    "memfs": "^4.57.7",
+    "miniflare": "^4.20260616.0",
+    "npm": "^11.17.0"
+  }
+}

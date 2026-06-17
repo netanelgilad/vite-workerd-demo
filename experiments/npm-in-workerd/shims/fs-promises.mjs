@@ -1,0 +1,27 @@
+// node:fs/promises replacement backed by the shared in-heap memfs volume.
+import mfs from "/tmp/shims/fs.mjs";
+const p = mfs.promises;
+export default p;
+export const access = p.access.bind(p);
+export const appendFile = p.appendFile.bind(p);
+export const chmod = p.chmod.bind(p);
+export const copyFile = p.copyFile.bind(p);
+export const lstat = p.lstat.bind(p);
+export const mkdir = p.mkdir.bind(p);
+export const mkdtemp = p.mkdtemp.bind(p);
+export const open = p.open.bind(p);
+export const readFile = p.readFile.bind(p);
+export const readdir = p.readdir.bind(p);
+export const readlink = p.readlink.bind(p);
+export const realpath = p.realpath.bind(p);
+export const rename = p.rename.bind(p);
+export const rm = p.rm.bind(p);
+export const rmdir = p.rmdir.bind(p);
+export const stat = p.stat.bind(p);
+export const symlink = p.symlink.bind(p);
+export const truncate = p.truncate.bind(p);
+export const unlink = p.unlink.bind(p);
+export const utimes = p.utimes.bind(p);
+export const watch = p.watch ? p.watch.bind(p) : undefined;
+export const writeFile = p.writeFile.bind(p);
+export const constants = mfs.constants ?? {};
