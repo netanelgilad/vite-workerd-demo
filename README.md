@@ -124,8 +124,12 @@ docs/rolldown-fork-findings.md
 - **Memory**: workerd RSS is dominated by the wasm heaps (esbuild's Go runtime +
   Rolldown); it ratchets up across repeated builds since wasm memory can't
   shrink. For production the fix is isolate **recycling** at ms-spawn cost.
-- **HMR transport**: the invalidation core works (edit → invalidate → fresh
-  module); wiring Vite's `ws` HMR server to workerd's native `WebSocketPair` is
-  mechanical and not included in this minimal demo.
+- **HMR**: Vite's HMR client connects over `/__hmr` (workerd's native
+  `WebSocketPair`, since Vite can't bind its own port inside the isolate), so the
+  browser console is clean and `import.meta.hot` is live. What's *not* wired yet
+  is edit-to-reload: nothing watches `app/` on the host and pushes changes into
+  the isolate's memfs, so saving a file won't hot-update the page. The transport
+  and module-graph invalidation are in place (`/__hmr` + `/dev/write`); the
+  missing piece is a host watcher feeding writes over the socket.
 - This started as a research spike; `byte-identical` is verified per machine via
   `npm run verify`.

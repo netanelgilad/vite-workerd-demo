@@ -99,36 +99,30 @@ function hmrBroadcast(msg) {
   return hmrSockets.size;
 }
 
-const HMR_CLIENT = `
-<script type="module">
-  // isolate push-HMR client: the server owns the write path, so updates are
-  // pushed here directly — no file watcher anywhere.
-  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/__hmr");
-  ws.onmessage = (e) => {
-    const m = JSON.parse(e.data);
-    if (m.type === "full-reload") location.reload();
-  };
-</script>`;
-
 async function inlineConfig(mode) {
   const { default: react } = await import("@vitejs/plugin-react");
+  // In middleware mode workerd has no Node http server for vite to attach its
+  // HMR WebSocket server to, and vite would otherwise bind a standalone port
+  // (24678) that can't open inside workerd — the browser then logs endless
+  // "WebSocket connection failed" errors. Handing vite a dummy `hmr.server`
+  // switches it to noServer mode (no port binding) and tells vite's client to
+  // use the page's own origin. The HMR socket then upgrades on `/__hmr`, which
+  // the driver's fetch handler accepts natively via WebSocketPair.
+  const { EventEmitter } = await import("node:events");
   return {
     root: "/tmp/app",
     configFile: false,
     envFile: false,
     mode,
     logLevel: "info",
-    plugins: [
-      react(),
-      {
-        name: "isolate-hmr-client",
-        apply: "serve",
-        transformIndexHtml(html) {
-          return html.replace("</head>", HMR_CLIENT + "</head>");
-        },
-      },
-    ],
-    server: { middlewareMode: true, hmr: false, watch: null, host: "127.0.0.1", allowedHosts: true },
+    plugins: [react()],
+    server: {
+      middlewareMode: true,
+      hmr: { server: new EventEmitter(), path: "/__hmr", protocol: "ws" },
+      watch: null,
+      host: "127.0.0.1",
+      allowedHosts: true,
+    },
   };
 }
 
@@ -161,6 +155,17 @@ async function dispatchToConnect(middlewares, request) {
   req.method = request.method;
   req.headers = Object.fromEntries([...request.headers].map(([k, v]) => [k.toLowerCase(), v]));
   req.headers.host = url.host;
+  // Vite 8's per-module dev middleware chain short-circuits top-level document
+  // navigations (Sec-Fetch-Dest: document/iframe/...): transformMiddleware
+  // next()s them on the assumption that a full HTTP server's SPA html
+  // middleware will serve the index shell. In this isolate proxy that path
+  // falls through to a 404 ("vite middleware did not handle: /"). Dropping the
+  // document-family dest makes the navigation serve the transformed index.html
+  // shell like any other request (script/style requests keep their dest, which
+  // transformMiddleware relies on).
+  if (["document", "iframe", "frame", "fencedframe"].includes(req.headers["sec-fetch-dest"])) {
+    delete req.headers["sec-fetch-dest"];
+  }
   req.socket = { remoteAddress: "127.0.0.1", encrypted: false };
   req.connection = req.socket;
   req.httpVersion = "1.1";
@@ -427,7 +432,12 @@ export default {
             }
           });
           server.send(JSON.stringify({ type: "connected" }));
-          return new Response(null, { status: 101, webSocket: client });
+          // vite's HMR client opens the socket with the "vite-hmr" subprotocol;
+          // echo it back so the browser's subprotocol negotiation succeeds.
+          const offered = request.headers.get("Sec-WebSocket-Protocol");
+          const headers = {};
+          if (offered) headers["Sec-WebSocket-Protocol"] = offered.split(",")[0].trim();
+          return new Response(null, { status: 101, webSocket: client, headers });
         }
         const server = await ensureDevServer();
         const pathname = url.pathname.startsWith("/preview")

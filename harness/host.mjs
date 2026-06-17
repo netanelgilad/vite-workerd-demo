@@ -259,6 +259,9 @@ const APP_DEP_PACKAGES = [
   { name: "react-dom" },
   { name: "scheduler" },
   { name: "react-refresh" },
+  // @vitejs/plugin-react serves its dist/refresh-runtime.js for /@react-refresh
+  // (read via fs) when React Fast Refresh is enabled in the dev server
+  { name: "@vitejs/plugin-react" },
   // modern-app extras (app-modern; absent in app7)
   { name: "react-router", optional: true },
   { name: "cookie", optional: true }, // react-router runtime dep
