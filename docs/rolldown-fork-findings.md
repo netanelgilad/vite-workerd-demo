@@ -69,7 +69,7 @@ Applied to `@emnapi/core`, `@emnapi/runtime`, `@tybys/wasm-util` (all gitignored
   synchronous execution (Spectre mitigation); the shim's
   `while (Date.now() < end) {}` sleep otherwise never terminates.
 
-### 5. Binding loader — `harness/patch-st-binding.py`
+### 5. Binding loader — `harness/rolldown-fork/patches/patch-st-binding.py` (pre-applied in `harness/rolldown-shim/`)
 - Non-shared imported memory; workers forbidden; wasm injected as a precompiled
   `CompiledWasm` module (workerd won't runtime-compile a 12 MB module).
 - **Lazy in-handler instantiation.** workerd evaluates a dynamically-imported
@@ -97,24 +97,22 @@ Applied to `@emnapi/core`, `@emnapi/runtime`, `@tybys/wasm-util` (all gitignored
 
 ## Reproduce
 
+The Rust source patches (layers 1–3) and the binding patch (layer 5) live in
+[`../harness/rolldown-fork/patches/`](../harness/rolldown-fork/patches/), with
+full build steps in [`../harness/rolldown-fork/BUILD.md`](../harness/rolldown-fork/BUILD.md).
+In this extracted demo `rolldown.wasm` and the patched `rolldown-shim/` are
+already vendored, so you only need:
+
 ```bash
-# 1. fork + patches
-cd rolldown-fork && git apply ../rolldown-singlethread.patch
-cp -r <napi-3.9.x>       vendored/napi       && (cd vendored/napi && patch -p1 < ../../../napi-vendored-tokio_runtime.patch)
-cp -r <napi-build-2.3.x> vendored/napi-build && (cd vendored/napi-build && patch -p1 < ../../../napi-build-wasi.patch)
-rustup target add wasm32-wasip1
-EMNAPI_LINK_DIR=<emnapi>/lib/wasm32-wasip1 \
-  cargo build --target wasm32-wasip1 --profile release-wasi -p rolldown_binding   # -> 12 MB wasm (stripped)
+# JS patches (layer 4) are applied automatically by harness `postinstall`:
+cd harness && npm install        # runs patch-emnapi-wasi.mjs
 
-# 2. harness JS patches (idempotent)
-cd ../harness && npm install && node patch-emnapi-wasi.mjs
-
-# 3. verify
-SPIKE_VITE8=1 SPIKE_APP_DIR=../app          node run-verify.mjs     # ✅ 8/8 byte-identical
-SPIKE_VITE8=1 SPIKE_APP_DIR=../app-modern8   node run-verify.mjs     # ✅ 4/4 byte-identical (tailwind+router+query)
-SPIKE_VITE8=1 SPIKE_APP_DIR=../app          node run-dev-graph.mjs  # ✅ dev server module graph 200
-SPIKE_APP_DIR=../app7                        node run-verify.mjs     # ✅ Vite 7 path, no regression
+# verify
+npm run verify:build             # ✅ 4/4 byte-identical (tailwind + router + query)
+npm run dev                      # ✅ dev server in workerd, with real HMR
 ```
+
+To rebuild the wasm from source (layers 1–3), see `rolldown-fork/BUILD.md`.
 
 ## Why this matters
 

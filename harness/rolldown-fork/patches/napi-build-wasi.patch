@@ -1,0 +1,31 @@
+--- /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-build-2.3.2/src/wasi.rs	2006-07-24 01:21:28.000000000 +0000
++++ vendored/napi-build/src/wasi.rs	2026-06-12 14:45:37.312212185 +0000
+@@ -4,15 +4,24 @@
+   let link_dir = env::var("EMNAPI_LINK_DIR").expect("EMNAPI_LINK_DIR must be set");
+   println!("cargo:rerun-if-env-changed=EMNAPI_LINK_DIR");
+   println!("cargo:rustc-link-search={link_dir}");
+-  println!("cargo:rustc-link-lib=static=emnapi-basic-mt");
++  // Single-threaded wasm32-wasip1 links the non-mt emnapi (the -mt variant
++  // needs __tls_* symbols that only exist with --shared-memory/threads).
++  let target_threads = env::var("TARGET").map(|t| t.contains("threads")).unwrap_or(false);
++  if target_threads {
++    println!("cargo:rustc-link-lib=static=emnapi-basic-mt");
++  } else {
++    println!("cargo:rustc-link-lib=static=emnapi-basic");
++  }
+   println!("cargo:rustc-link-arg=--export=malloc");
+   println!("cargo:rustc-link-arg=--export=free");
+   println!("cargo:rustc-link-arg=--export=napi_register_wasm_v1");
+   println!("cargo:rustc-link-arg=--export-if-defined=node_api_module_get_api_version_v1");
+   println!("cargo:rustc-link-arg=--export-table");
+-  println!("cargo:rustc-link-arg=--export=emnapi_async_worker_create");
+-  println!("cargo:rustc-link-arg=--export=emnapi_async_worker_init");
+-  println!("cargo:rustc-link-arg=--export=emnapi_thread_crashed");
++  if target_threads {
++    println!("cargo:rustc-link-arg=--export=emnapi_async_worker_create");
++    println!("cargo:rustc-link-arg=--export=emnapi_async_worker_init");
++    println!("cargo:rustc-link-arg=--export=emnapi_thread_crashed");
++  }
+   println!("cargo:rustc-link-arg=--import-memory");
+   println!("cargo:rustc-link-arg=--import-undefined");
+   println!("cargo:rustc-link-arg=--max-memory=4294967296");

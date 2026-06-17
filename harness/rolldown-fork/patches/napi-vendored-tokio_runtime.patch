@@ -1,0 +1,83 @@
+--- /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/napi-3.9.1/src/tokio_runtime.rs	2006-07-24 01:21:28.000000000 +0000
++++ vendored/napi/src/tokio_runtime.rs	2026-06-12 15:38:08.481311668 +0000
+@@ -242,9 +242,7 @@
+ 
+   #[cfg(all(target_family = "wasm", not(tokio_unstable)))]
+   {
+-    std::thread::spawn(|| {
+-      block_on(inner);
+-    });
++    spawn(inner);
+   }
+ 
+   Ok(promise.0.value)
+@@ -311,9 +309,7 @@
+ 
+   #[cfg(all(target_family = "wasm", not(tokio_unstable)))]
+   {
+-    std::thread::spawn(|| {
+-      block_on(inner);
+-    });
++    spawn(inner);
+   }
+ 
+   Ok(promise.0.value)
+@@ -414,3 +410,58 @@
+     Ok(val.inner)
+   }
+ }
++
++
++#[cfg(not(feature = "noop"))]
++/// Drive the tokio runtime cooperatively from the JS thread.
++///
++/// On single-threaded wasm there is no thread to run the runtime; the JS
++/// side must call this in a loop (yielding to the JS event loop between
++/// calls) until the pending promise settles. Each call gives the
++/// current-thread scheduler `budget` cooperative passes: ready tasks run,
++/// tasks pending on JS callbacks stay parked.
++// --- single-threaded, non-parking pump for wasm -------------------------
++//
++// On a single-threaded wasm isolate (no worker), tokio's `block_on` would
++// PARK the only thread whenever the runtime runs out of immediately-ready
++// work — waiting for a waker that can never fire, since the JS event loop
++// (which resolves the promises the wasm awaits) can't run while we're parked.
++// That's a deadlock.
++//
++// Fix: keep one always-ready "keepalive" task on the runtime. It keeps the
++// scheduler's run queue non-empty so `block_on` never parks. The pump then
++// drives the runtime for a bounded number of cooperative ticks and returns,
++// handing control back to the JS event loop so it can settle the awaited
++// promises before the next pump call.
++#[cfg(all(target_family = "wasm", not(tokio_unstable)))]
++mod wasm_pump {
++  use std::sync::atomic::{AtomicBool, Ordering};
++  pub static KEEPALIVE_SPAWNED: AtomicBool = AtomicBool::new(false);
++}
++
++#[cfg(all(target_family = "wasm", not(tokio_unstable)))]
++pub fn pump_tokio_runtime(budget: u32) {
++  use std::sync::atomic::Ordering;
++  if let Ok(guard) = RT.read() {
++    if let Some(rt) = guard.as_ref() {
++      // spawn the keepalive once: an always-ready task that yields forever,
++      // keeping the run queue non-empty so block_on never parks.
++      if !wasm_pump::KEEPALIVE_SPAWNED.swap(true, Ordering::SeqCst) {
++        rt.spawn(async {
++          loop {
++            tokio::task::yield_now().await;
++          }
++        });
++      }
++      // drive `budget` cooperative ticks, then return to the JS event loop.
++      rt.block_on(async move {
++        for _i in 0..budget {
++          tokio::task::yield_now().await;
++        }
++      });
++    }
++  }
++}
++
++#[cfg(not(all(target_family = "wasm", not(tokio_unstable))))]
++pub fn pump_tokio_runtime(_budget: u32) {}

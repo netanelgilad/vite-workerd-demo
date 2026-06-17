@@ -101,6 +101,11 @@ applies the JS-side companions (emnapi scheduler redirect, WASI clock/poll fixes
 for workerd's frozen-during-sync-execution clock). Full writeup:
 [`docs/rolldown-fork-findings.md`](docs/rolldown-fork-findings.md).
 
+`rolldown.wasm` is a prebuilt binary; the Rust + binding **source patches** that
+produce it (the 5-layer fix) live in
+[`harness/rolldown-fork/`](harness/rolldown-fork/BUILD.md) so it's auditable and
+rebuildable, not an opaque blob.
+
 ## Layout
 
 ```
@@ -108,8 +113,9 @@ app/                        the demo app (Vite 8 + Tailwind v3 + router + query)
 harness/
   host.mjs                  miniflare host: module fallback service + manifest + rewrites
   worker/driver.mjs         the in-isolate driver (build / dev / preview routes)
-  worker/rolldown.wasm      single-threaded Rolldown fork (12 MB)
+  worker/rolldown.wasm      single-threaded Rolldown fork, prebuilt (12 MB)
   rolldown-shim/            patched @rolldown/browser loader (installed as node_modules/rolldown)
+  rolldown-fork/            source patches (Rust + binding) that build rolldown.wasm + BUILD.md
   shims/                    in-heap memfs fs / fs-promises, esbuild-wasm shim, bash
   patch-emnapi-wasi.mjs     reproducible JS-side patches for single-threaded workerd
   run-dev.mjs               `npm run dev`   — browser-accessible dev server on a real port

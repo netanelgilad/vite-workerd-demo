@@ -1,0 +1,122 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 4976d79..e85818e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -303,3 +303,7 @@ opt-level = "s"
+ # it will strip these information for non-debug files
+ debug = "full"
+ strip = "none"
++
++[patch.crates-io]
++napi = { path = "vendored/napi" }
++napi-build = { path = "vendored/napi-build" }
+diff --git a/crates/rolldown_binding/src/lib.rs b/crates/rolldown_binding/src/lib.rs
+index b140a42..dcd859d 100644
+--- a/crates/rolldown_binding/src/lib.rs
++++ b/crates/rolldown_binding/src/lib.rs
+@@ -68,6 +68,23 @@ pub fn shutdown_async_runtime() {
+   }
+ }
+ 
++#[napi]
++/// Cooperatively drive the tokio runtime from the JS thread.
++///
++/// Single-threaded wasm builds have no thread to run async tasks; the JS
++/// glue calls this in a loop (yielding to the event loop between calls)
++/// until the pending operation's promise settles.
++pub fn pump_async_runtime(budget: u32) {
++  #[cfg(all(target_family = "wasm", not(tokio_unstable)))]
++  {
++    napi::bindgen_prelude::pump_tokio_runtime(budget);
++  }
++  #[cfg(not(all(target_family = "wasm", not(tokio_unstable))))]
++  {
++    let _ = budget;
++  }
++}
++
+ #[napi]
+ /// Start the async runtime manually.
+ ///
+diff --git a/crates/rolldown_plugin_asset_module/Cargo.toml b/crates/rolldown_plugin_asset_module/Cargo.toml
+index deff38d..2f69c81 100644
+--- a/crates/rolldown_plugin_asset_module/Cargo.toml
++++ b/crates/rolldown_plugin_asset_module/Cargo.toml
+@@ -20,4 +20,6 @@ rolldown_utils = { workspace = true }
+ rustc-hash = { workspace = true }
+ string_wizard = { workspace = true }
+ sugar_path = { workspace = true }
++tokio = { workspace = true }
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ tokio = { workspace = true, features = ["fs"] }
+diff --git a/crates/rolldown_plugin_asset_module/src/lib.rs b/crates/rolldown_plugin_asset_module/src/lib.rs
+index 2b0c679..e94fafa 100644
+--- a/crates/rolldown_plugin_asset_module/src/lib.rs
++++ b/crates/rolldown_plugin_asset_module/src/lib.rs
+@@ -144,9 +144,13 @@ impl AssetModulePlugin {
+     let path = Path::new(clean_id);
+ 
+     // Read file as binary (use cleaned path for filesystem access)
++    #[cfg(not(target_family = "wasm"))]
+     let bytes = tokio::fs::read(clean_id)
+       .await
+       .map_err(|e| anyhow::anyhow!("Failed to read asset module {clean_id}: {e}"))?;
++    #[cfg(target_family = "wasm")]
++    let bytes = std::fs::read(clean_id)
++      .map_err(|e| anyhow::anyhow!("Failed to read asset module {clean_id}: {e}"))?;
+ 
+     // Derive name from the cleaned file path
+     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("asset").to_string();
+diff --git a/crates/rolldown_plugin_copy_module/Cargo.toml b/crates/rolldown_plugin_copy_module/Cargo.toml
+index f397d2a..2000c3b 100644
+--- a/crates/rolldown_plugin_copy_module/Cargo.toml
++++ b/crates/rolldown_plugin_copy_module/Cargo.toml
+@@ -21,4 +21,6 @@ rolldown_utils = { workspace = true }
+ rustc-hash = { workspace = true }
+ string_wizard = { workspace = true }
+ sugar_path = { workspace = true }
++tokio = { workspace = true }
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ tokio = { workspace = true, features = ["fs"] }
+diff --git a/crates/rolldown_plugin_copy_module/src/lib.rs b/crates/rolldown_plugin_copy_module/src/lib.rs
+index cb4e993..c140b82 100644
+--- a/crates/rolldown_plugin_copy_module/src/lib.rs
++++ b/crates/rolldown_plugin_copy_module/src/lib.rs
+@@ -99,9 +99,13 @@ impl Plugin for CopyModulePlugin {
+     }
+ 
+     // Read the file bytes asynchronously to avoid blocking the tokio worker thread
++    #[cfg(not(target_family = "wasm"))]
+     let bytes = tokio::fs::read(clean_id)
+       .await
+       .map_err(|e| anyhow::anyhow!("Failed to read copy module {}: {e}", resolved_id.id))?;
++    #[cfg(target_family = "wasm")]
++    let bytes = std::fs::read(clean_id)
++      .map_err(|e| anyhow::anyhow!("Failed to read copy module {}: {e}", resolved_id.id))?;
+ 
+     // Derive a name from the file path
+     let file_name =
+diff --git a/crates/rolldown_plugin_replace/Cargo.toml b/crates/rolldown_plugin_replace/Cargo.toml
+index f9382a7..065066e 100644
+--- a/crates/rolldown_plugin_replace/Cargo.toml
++++ b/crates/rolldown_plugin_replace/Cargo.toml
+@@ -27,4 +27,6 @@ string_wizard = { workspace = true }
+ [dev-dependencies]
+ rolldown = { workspace = true }
+ rolldown_testing = { path = '../rolldown_testing' }
+-tokio = { workspace = true, features = ["rt", "macros", "sync", "rt-multi-thread"] }
++tokio = { workspace = true, features = ["rt", "macros", "sync"] }
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
++tokio = { workspace = true, features = ["rt-multi-thread"] }
+diff --git a/crates/rolldown_watcher/Cargo.toml b/crates/rolldown_watcher/Cargo.toml
+index d349ccd..777a9c4 100644
+--- a/crates/rolldown_watcher/Cargo.toml
++++ b/crates/rolldown_watcher/Cargo.toml
+@@ -31,4 +31,6 @@ tracing = { workspace = true }
+ [dev-dependencies]
+ rolldown_workspace = { workspace = true }
+ sugar_path = { workspace = true }
+-tokio = { workspace = true, features = ["rt", "macros", "sync", "rt-multi-thread", "signal"] }
++tokio = { workspace = true, features = ["rt", "macros", "sync"] }
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
++tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
