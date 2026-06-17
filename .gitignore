@@ -1,0 +1,6 @@
+node_modules/
+app/dist/
+harness/workerd-dist/
+harness/node_modules/
+*.log
+.DS_Store

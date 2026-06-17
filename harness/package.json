@@ -1,0 +1,26 @@
+{
+  "name": "harness",
+  "version": "1.0.0",
+  "description": "Host harness that boots workerd (via miniflare) and runs Vite build/dev inside the isolate",
+  "private": true,
+  "scripts": {
+    "postinstall": "node patch-emnapi-wasi.mjs",
+    "build": "node run-build.mjs",
+    "verify": "node run-verify.mjs",
+    "dev": "node run-dev-graph.mjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@rolldown/browser": "^1.1.1",
+    "@rollup/wasm-node": "^4.61.1",
+    "cjs-module-lexer": "^2.2.0",
+    "enhanced-resolve": "^5.24.0",
+    "es-module-lexer": "^2.1.0",
+    "esbuild-wasm": "^0.27.7",
+    "isomorphic-git": "^1.38.4",
+    "just-bash": "^3.0.1",
+    "lightningcss-wasm": "^1.32.0",
+    "memfs": "^4.57.7",
+    "miniflare": "^4.20260611.0"
+  }
+}
