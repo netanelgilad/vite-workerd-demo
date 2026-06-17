@@ -2,7 +2,7 @@
 // service that resolves the worker's imports against real node_modules on
 // disk, applying aliases (esbuild -> esbuild-wasm shim, rollup -> wasm-node)
 // and source rewrites (import.meta.url, WebAssembly.Module under UnsafeEval).
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, watch } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -316,9 +316,62 @@ export function buildManifest() {
   return files;
 }
 
+// ---- file watcher: feeds edits to the isolate's HMR pump via /hmr-wait ----
+// The isolate can't watch its in-heap memfs, and a real fs doesn't exist there.
+// So the host watches the app on disk; each browser socket's pump long-polls
+// /hmr-wait, applies the new bytes into memfs and fires vite's HMR.
+const HMR_MAX = 200;
+const hmrChanges = []; // { seq, path (virtual), content (base64) }
+let hmrSeq = 0;
+let hmrWaiters = [];
+const hmrDebounce = new Map();
+
+function recordChange(hostPath) {
+  try {
+    if (!existsSync(hostPath) || !statSync(hostPath).isFile()) return;
+    const virt = host2virt(hostPath);
+    if (!virt) return;
+    hmrChanges.push({ seq: ++hmrSeq, path: virt, content: readFileSync(hostPath).toString("base64") });
+    if (hmrChanges.length > HMR_MAX) hmrChanges.splice(0, hmrChanges.length - HMR_MAX);
+    const waiters = hmrWaiters; hmrWaiters = [];
+    for (const w of waiters) w();
+    console.log(`[hmr] change #${hmrSeq} ${virt}`);
+  } catch { /* file vanished mid-edit, etc. */ }
+}
+
+function startWatcher() {
+  try {
+    watch(APP_DIR, { recursive: true }, (_event, filename) => {
+      if (!filename) return;
+      const rel = String(filename);
+      if (rel.includes("node_modules") || rel.includes("dist/") || rel.startsWith("dist") || rel.includes(".git")) return;
+      const hostPath = path.join(APP_DIR, rel);
+      clearTimeout(hmrDebounce.get(hostPath)); // fs.watch fires repeatedly per save
+      hmrDebounce.set(hostPath, setTimeout(() => { hmrDebounce.delete(hostPath); recordChange(hostPath); }, 40));
+    });
+    console.log(`[hmr] watching ${APP_DIR}`);
+  } catch (e) { console.warn("[hmr] watch unavailable:", e.message); }
+}
+
 // ---- host service binding: serves the manifest + esbuild wasm to the worker ----
 async function hostService(request) {
   const url = new URL(request.url);
+  if (url.pathname === "/hmr-wait") {
+    const since = Number(url.searchParams.get("since") || 0);
+    const ready = hmrChanges.find((c) => c.seq > since);
+    if (ready) return new MfResponse(JSON.stringify(ready), { headers: { "content-type": "application/json" } });
+    // long-poll: resolve when the next change arrives, or idle out so the pump re-polls
+    return await new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return; done = true;
+        const c = hmrChanges.find((x) => x.seq > since);
+        resolve(new MfResponse(JSON.stringify(c || { idle: true, seq: hmrSeq }), { headers: { "content-type": "application/json" } }));
+      };
+      hmrWaiters.push(finish);
+      setTimeout(finish, 25000);
+    });
+  }
   if (url.pathname === "/manifest") {
     const m = buildManifest();
     const bytes = Object.values(m).reduce((a, b) => a + b.length, 0);
@@ -336,7 +389,8 @@ async function hostService(request) {
   return new MfResponse("not found", { status: 404 });
 }
 
-export async function createHarness({ verboseLog = false, port, host } = {}) {
+export async function createHarness({ verboseLog = false, port, host, watch: doWatch = false } = {}) {
+  if (doWatch) startWatcher();
   const mf = new Miniflare({
     log: new Log(verboseLog ? LogLevel.DEBUG : LogLevel.INFO),
     // When `port` is given, workerd listens on a real socket so a browser can

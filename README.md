@@ -124,12 +124,21 @@ docs/rolldown-fork-findings.md
 - **Memory**: workerd RSS is dominated by the wasm heaps (esbuild's Go runtime +
   Rolldown); it ratchets up across repeated builds since wasm memory can't
   shrink. For production the fix is isolate **recycling** at ms-spawn cost.
-- **HMR**: Vite's HMR client connects over `/__hmr` (workerd's native
-  `WebSocketPair`, since Vite can't bind its own port inside the isolate), so the
-  browser console is clean and `import.meta.hot` is live. What's *not* wired yet
-  is edit-to-reload: nothing watches `app/` on the host and pushes changes into
-  the isolate's memfs, so saving a file won't hot-update the page. The transport
-  and module-graph invalidation are in place (`/__hmr` + `/dev/write`); the
-  missing piece is a host watcher feeding writes over the socket.
+- **HMR works** — real Vite HMR, not a full-page reload. Edit a `.tsx` and the
+  change hot-swaps in the browser with React state preserved. How it works,
+  given two workerd constraints:
+  - Vite's HMR server is the `ws` npm package, which needs a raw TCP socket and
+    an inbound listener — neither exists in workerd. So the client environment
+    is given a **custom HotChannel transport** (`hotChannel` in `driver.mjs`)
+    backed by workerd's `WebSocketPair` instead of `ws`. Vite's real HMR pipeline
+    (`hot.send`) drives it; the stock `@vite/client` connects over `/__hmr`.
+  - An accepted WebSocket can only be used from the request context that
+    accepted it. So each socket is driven by a **pump loop running inside its own
+    `/__hmr` request** (via `ctx.waitUntil`): it long-polls the host file watcher
+    (`/hmr-wait`), writes changed bytes into memfs, and fires
+    `server.watcher.emit("change", …)` — Vite computes the update and sends it
+    back over that same socket, in-context.
+  - The host watches `app/` on disk (`fs.watch`) since the isolate can't watch
+    its in-heap memfs.
 - This started as a research spike; `byte-identical` is verified per machine via
   `npm run verify`.

@@ -89,25 +89,63 @@ async function collectDir(dir) {
   return out;
 }
 
-// live HMR sockets (accepted server ends of WebSocketPair), isolate-lifetime
-const hmrSockets = new Set();
-function hmrBroadcast(msg) {
-  const data = JSON.stringify(msg);
-  for (const s of hmrSockets) {
-    try { s.send(data); } catch { hmrSockets.delete(s); }
-  }
-  return hmrSockets.size;
+// ---- Real Vite HMR transport over workerd WebSocketPair ----
+// Vite's own HMR server is the `ws` npm package, which needs a raw TCP socket
+// and an inbound listener — neither exists in workerd (it terminates the
+// WebSocket handshake in C++ and hands back a high-level WebSocket). So instead
+// of letting Vite run `ws`, we give the client environment a custom HotChannel:
+// Vite's real HMR pipeline calls `hot.send(payload)`, we serialize it to the
+// connected browser sockets; inbound {type:"custom"} messages route back to
+// Vite's listeners. This is the supported transport-agnostic extension point
+// (vite wraps any non-ws transport via normalizeHotChannel).
+//
+// workerd constraint: an accepted WebSocket can only be used from the request
+// context that accepted it. So each socket is driven by a pump loop that runs
+// inside its own `/__hmr` request (via ctx.waitUntil) — every send to a socket
+// happens in that socket's own context. Cross-context sends (one socket's pump
+// reaching another socket) simply throw and are ignored; each socket also
+// self-delivers from its own pump, so every tab still updates.
+const hotClients = new Set();   // accepted server-side WebSockets
+const hotListeners = new Map(); // event -> Set<listener>
+let hotBuffered = null;         // error/full-reload buffered until a client connects
+
+function hotEmit(event, data, socket) {
+  const set = hotListeners.get(event);
+  if (!set || !set.size) return;
+  const client = { send: (payload) => { try { socket.send(JSON.stringify(payload)); } catch {} } };
+  for (const fn of set) fn(data, client);
+}
+
+const hotChannel = {
+  send(payload) {
+    if ((payload.type === "error" || payload.type === "full-reload") && hotClients.size === 0) { hotBuffered = payload; return; }
+    const json = JSON.stringify(payload);
+    for (const s of hotClients) { try { s.send(json); } catch { /* cross-context: the socket's own pump delivers */ } }
+  },
+  on(event, fn) { if (!hotListeners.has(event)) hotListeners.set(event, new Set()); hotListeners.get(event).add(fn); },
+  off(event, fn) { hotListeners.get(event)?.delete(fn); },
+  listen() {},
+  close() { hotClients.clear(); hotListeners.clear(); },
+};
+
+function hotAddClient(socket) {
+  hotClients.add(socket);
+  socket.addEventListener("message", (e) => {
+    let parsed; try { parsed = JSON.parse(typeof e.data === "string" ? e.data : ""); } catch { return; }
+    if (parsed?.type === "custom" && parsed.event) hotEmit(parsed.event, parsed.data, socket);
+  });
+  socket.addEventListener("close", () => { hotClients.delete(socket); hotEmit("vite:client:disconnect", undefined, socket); });
+  hotEmit("vite:client:connect", undefined, socket);
+  try { socket.send(JSON.stringify({ type: "connected" })); } catch {}
+  if (hotBuffered) { try { socket.send(JSON.stringify(hotBuffered)); } catch {} hotBuffered = null; }
 }
 
 async function inlineConfig(mode) {
   const { default: react } = await import("@vitejs/plugin-react");
-  // In middleware mode workerd has no Node http server for vite to attach its
-  // HMR WebSocket server to, and vite would otherwise bind a standalone port
-  // (24678) that can't open inside workerd — the browser then logs endless
-  // "WebSocket connection failed" errors. Handing vite a dummy `hmr.server`
-  // switches it to noServer mode (no port binding) and tells vite's client to
-  // use the page's own origin. The HMR socket then upgrades on `/__hmr`, which
-  // the driver's fetch handler accepts natively via WebSocketPair.
+  const { DevEnvironment } = await import("vite");
+  // Hand vite a dummy `hmr.server` so it uses noServer mode (no 24678 bind, which
+  // workerd can't do) and tells its client to connect over the page origin at
+  // `/__hmr`. The actual transport is our WebSocketPair-backed HotChannel below.
   const { EventEmitter } = await import("node:events");
   return {
     root: "/tmp/app",
@@ -122,6 +160,15 @@ async function inlineConfig(mode) {
       watch: null,
       host: "127.0.0.1",
       allowedHosts: true,
+    },
+    environments: {
+      client: {
+        dev: {
+          // Replace the default `ws`-backed transport with our HotChannel.
+          createEnvironment: (name, config) =>
+            new DevEnvironment(name, config, { hot: true, transport: hotChannel, disableFetchModule: true }),
+        },
+      },
     },
   };
 }
@@ -359,22 +406,6 @@ export default {
         await new Promise((r) => setTimeout(r, 300));
         return Response.json({ ok: true, ms: Date.now() - t0, mainLen: tr?.code?.length ?? null, depResults });
       }
-      if (url.pathname === "/dev/write") {
-        await ensureVfs(env);
-        const server = await ensureDevServer();
-        const fs = await getFs();
-        const body = await request.json();
-        fs.writeFileSync(body.path, body.content);
-        // no file watcher in the isolate: we own the write path, so we
-        // invalidate the module graph explicitly (push-based HMR)
-        const envClient = server.environments?.client;
-        const graph = envClient?.moduleGraph ?? server.moduleGraph;
-        const mods = graph.getModulesByFile(body.path);
-        let invalidated = 0;
-        if (mods) for (const m of mods) { graph.invalidateModule(m); invalidated++; }
-        const notified = hmrBroadcast({ type: "full-reload", path: body.path });
-        return Response.json({ ok: true, invalidated, notified });
-      }
       if (url.pathname === "/dev/transform") {
         await ensureVfs(env);
         const server = await ensureDevServer();
@@ -407,31 +438,40 @@ export default {
           const pair = new WebSocketPair();
           const [client, server] = Object.values(pair);
           server.accept();
-          hmrSockets.add(server);
-          server.addEventListener("close", () => hmrSockets.delete(server));
-          // Writes arrive over this socket (a workerd accepted WebSocket can
-          // only be used from its own request context; in production a Durable
-          // Object owns all sockets and can broadcast across them). The write
-          // handler runs in this context, so the push works.
-          server.addEventListener("message", async (e) => {
-            try {
-              const m = JSON.parse(e.data);
-              if (m.type === "write") {
+          hotAddClient(server); // registers + sends {type:"connected"}, vite-protocol compatible
+
+          // Drive HMR for THIS socket from its own request context (so every
+          // socket.send is in-context). The pump long-polls the host file
+          // watcher; on a change it writes the new bytes into memfs and fires
+          // vite's real HMR pipeline, which sends the update over this socket.
+          let open = true;
+          server.addEventListener("close", () => { open = false; });
+          const pump = async () => {
+            let since = 0;
+            while (open) {
+              let data;
+              try {
+                const res = await env.HOST.fetch("http://host/hmr-wait?since=" + since);
+                data = await res.json();
+              } catch { break; }
+              if (data.idle) { since = data.seq ?? since; continue; }
+              since = data.seq;
+              try {
                 const fs = await getFs();
-                fs.writeFileSync(m.path, m.content);
+                const dir = data.path.slice(0, data.path.lastIndexOf("/"));
+                if (dir) fs.mkdirSync(dir, { recursive: true });
+                fs.writeFileSync(data.path, Buffer.from(data.content, "base64"));
                 const srv = await ensureDevServer();
-                const envClient = srv.environments?.client;
-                const graph = envClient?.moduleGraph ?? srv.moduleGraph;
-                const mods = graph.getModulesByFile(m.path);
-                let invalidated = 0;
-                if (mods) for (const mod of mods) { graph.invalidateModule(mod); invalidated++; }
-                server.send(JSON.stringify({ type: "full-reload", path: m.path, invalidated }));
+                // NoopWatcher is an EventEmitter; emitting "change" runs vite's
+                // real onFileChange → handleHMRUpdate → hot.send(update).
+                srv.watcher.emit("change", data.path);
+              } catch (err) {
+                try { server.send(JSON.stringify({ type: "error", err: String(err) })); } catch {}
               }
-            } catch (err) {
-              server.send(JSON.stringify({ type: "error", error: String(err) }));
             }
-          });
-          server.send(JSON.stringify({ type: "connected" }));
+          };
+          if (ctx?.waitUntil) ctx.waitUntil(pump()); else pump();
+
           // vite's HMR client opens the socket with the "vite-hmr" subprotocol;
           // echo it back so the browser's subprotocol negotiation succeeds.
           const offered = request.headers.get("Sec-WebSocket-Protocol");

@@ -7,7 +7,7 @@
 import { createHarness } from "./host.mjs";
 
 const PORT = Number(process.env.PORT ?? 5173);
-const { mf } = await createHarness({ port: PORT });
+const { mf } = await createHarness({ port: PORT, watch: true });
 
 // Resolve the actual listening URL (miniflare may pick another port if taken).
 const url = await mf.ready;
