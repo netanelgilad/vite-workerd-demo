@@ -9,3 +9,4 @@ harness/node_modules/
 # miniflare local cache
 .wrangler/
 **/.wrangler/
+experiments/npm-in-workerd/do-shell/worker/rolldown.wasm
