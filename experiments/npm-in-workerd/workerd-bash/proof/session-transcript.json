@@ -1,0 +1,29 @@
+{
+  "_note": "Real workerd-bash session, captured verbatim from `node workerd-bash/repl.mjs` (stdin piped). Every line ran INSIDE a workerd v8 isolate (the `Shell` Durable Object) over its shared NATIVE /tmp, on the VFS-module-loading fork binary at ~/Development/workerd-vfs.bin. The full @netanelgilad/vite tree install + `vite dev` is the documented flaky/OOM-prone step; see README 'Caveats'. This transcript proves the shell, real public-registry npm installs, and the ToDo-app scaffold all work end to end in the isolate.",
+  "command": "node workerd-bash/repl.mjs    (run from experiments/npm-in-workerd/)",
+  "forkBinary": "/Users/netanelg/Development/workerd-vfs.bin",
+  "devServerPort": 5190,
+  "transcript": [
+    { "prompt": "workerd:/tmp/proj$", "cmd": "pwd", "stdout": "/tmp/proj" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "echo hello from inside the v8 isolate > greeting.txt", "stdout": "" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "cat greeting.txt", "stdout": "hello from inside the v8 isolate" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "mkdir -p sub/deep", "stdout": "" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "ls", "stdout": "greeting.txt\nsub" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "npm install left-pad react react-dom", "stdout": "+ installed 4 packages in 10.0s\nnode_modules: react, react-dom, scheduler, left-pad", "note": "real Arborist install from https://registry.npmjs.org/ into the isolate's native /tmp/proj/node_modules" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "npm ls", "stdout": "react\nreact-dom\nscheduler\nleft-pad" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "scaffold", "stdout": "scaffolded ToDo app -> /tmp/proj (20 files: index.html, src/, tailwind/postcss config)" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "ls", "stdout": "README.md\ngreeting.txt\nindex.html\nnode_modules\npackage-lock.json\npackage.json\npostcss.config.js\npublic\nsrc\nsub\ntailwind.config.js\ntsconfig.app.json\ntsconfig.json\ntsconfig.node.json\nvite.config.ts" },
+    { "prompt": "workerd:/tmp/proj$", "cmd": "exit" }
+  ],
+  "alsoVerifiedSeparately": {
+    "pipes": "cat sub/a.txt | wc -l  ->  2",
+    "redirects": "echo a > f ; echo b >> f ; cat f  ->  a\\nb",
+    "stagedInstall": "react+react-dom (3 pkgs, 9.7s) then tailwindcss+autoprefixer+postcss (18 pkgs, 10s) installed across two `npm install` calls in ONE isolate session over the shared /tmp"
+  },
+  "fullViteFlowStatus": {
+    "wired": true,
+    "verifiedThisRun": false,
+    "reason": "The full @netanelgilad/vite + @netanelgilad/rolldown tree install SIGKILLed the fork workerd within seconds on every attempt (manifests as miniflare 'fetch failed' = workerd connection reset). Reproduced identically on the UNTOUCHED reference do-machine-clean runner. The machine was under heavy memory pressure during this session (swap ~15.7/17GB used, free RAM dipping to 284MB). The same do-machine-clean full flow (install -> vite dev -> browser ToDo app) was proven working ~2h earlier today (committed proof at experiments/npm-in-workerd/do-machine-clean/proof/browser-proof.json).",
+    "howToVerifyWhenIdle": "On an idle machine with >4GB free RAM: `node workerd-bash/repl.mjs`, then type `npm install` (retry if it crashes), `vite dev`, open the printed http://127.0.0.1:5190/ in a browser."
+  }
+}

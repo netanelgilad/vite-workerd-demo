@@ -1,0 +1,13 @@
+{
+  "name": "workerd-bash",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An interactive shell INTO a workerd v8 isolate (a Durable Object) over its shared native /tmp — type commands, run npm install + vite dev, open the ToDo app in your browser.",
+  "bin": {
+    "workerd-bash": "./repl.mjs"
+  },
+  "scripts": {
+    "start": "node ./repl.mjs"
+  }
+}
