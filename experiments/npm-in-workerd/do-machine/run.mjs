@@ -82,8 +82,10 @@ function buildEsbuildManifest() {
       files[o.virt + f.slice(o.host.length)] = readFileSync(f).toString("base64");
     }
   }
-  // the harness esbuild shim file, dropped at /tmp/proj/esbuild-shim.mjs
-  files["esbuild-shim.mjs"] = readFileSync(path.join(HARNESS, "shims/esbuild.mjs")).toString("base64");
+  // do-machine esbuild shim (native fs + native wasm read; no __HOST/memfs), dropped at
+  // /tmp/proj/esbuild-shim.mjs. The harness shim depends on __HOST.fetch + /tmp/shims/fs.mjs
+  // (memfs), neither of which exists in the do-machine child; this one uses native /tmp.
+  files["esbuild-shim.mjs"] = readFileSync(path.join(HERE, "worker/esbuild-shim-native.mjs")).toString("base64");
   return files;
 }
 
@@ -107,21 +109,30 @@ function hostService(request) {
   if (url.pathname === "/rolldown.wasm") {
     return new MfResponse(readFileSync(ROLLDOWN_WASM), { headers: { "content-type": "application/wasm" } });
   }
+  if (url.pathname === "/dev-probe") {
+    return new MfResponse(readFileSync(path.join(HERE, "worker/vite-dev-probe.mjs")), { headers: { "content-type": "text/javascript" } });
+  }
   return new MfResponse("not found", { status: 404 });
 }
 
+const DEV = process.env.DEV === "1";
+const PORT = Number(process.env.PORT ?? 5180);
+
 const mf = new Miniflare({
   log: new Log(verbose ? LogLevel.DEBUG : LogLevel.WARN),
+  // In DEV mode bind a real port so a browser can reach the in-isolate vite dev server.
+  ...(DEV ? { host: "127.0.0.1", port: PORT } : {}),
   modulesRoot: ROOT,
   modules: [
-    { type: "ESModule", path: "do-machine/worker/driver-do.mjs" },
-    { type: "ESModule", path: "do-machine/transform-tmp.mjs" },
+    { type: "ESModule", path: path.join(HERE, "worker/driver-do.mjs") },
+    { type: "ESModule", path: path.join(HERE, "transform-tmp.mjs") },
   ],
   compatibilityDate: "2026-06-01",
   compatibilityFlags: ["nodejs_compat", "experimental"],
   unsafeEvalBinding: "UNSAFE_EVAL",
   unsafeUseModuleFallbackService: true,
   unsafeModuleFallbackService: moduleFallback,
+  bindings: { DEV_PORT: String(PORT) },
   serviceBindings: { HOST: hostService },
   durableObjects: { RUNNER: "NpmChildRunner" },
   workerLoaders: { LOADER: {} },
@@ -145,6 +156,12 @@ async function call(pathAndQuery, label, ms = 300000) {
 
 let ok = false;
 try {
+  if (process.env.FSCAPS === "1") {
+    // Quick native-fs capability probe (no install) -- diagnose optimizer-commit fs ops.
+    await call("/fs-caps", "FS CAPABILITY PROBE (dir rename / rm-missing)", 30000);
+    await mf.dispose();
+    process.exit(0);
+  }
   console.log("# DO-MACHINE: run a real Vite/Rolldown toolchain from a DO's shared /tmp in child isolates");
   await call("/install", "INSTALL vite + react + plugin-react + tailwind (Arborist -> /tmp)", 600000);
   await call("/overlay-rolldown", "OVERLAY rolldown WASM fork into /tmp", 120000);
@@ -158,12 +175,35 @@ try {
   // UnsafeEval (wasm compile), node: builtins, the shared-/tmp module-eval fallback (emnapi/napi
   // glue + wasm bytes read at eval time), and the exports-condition fix -- then bundles real code.
   const rd = await call("/run-rolldown", "RUN CHILD: boot rolldown WASM fork + bundle from /tmp");
-  // RUNG 3-full (in progress): vite build of the ToDo app from /tmp.
-  await call("/run-vite-build", "RUN CHILD: vite build ToDo app from /tmp", 300000);
-  ok = rd.status === 200 && /OK chunks=/.test(JSON.stringify(rd.json?.result?.build ?? ""));
+  // RUNG 3-full: vite build of the ToDo app from /tmp.
+  const build = await call("/run-vite-build", "RUN CHILD: vite build ToDo app from /tmp", 300000);
+  const buildOk = build.status === 200 && Array.isArray(build.json?.result?.dist) &&
+    build.json.result.dist.includes("index.html") && Array.isArray(build.json?.result?.assets) &&
+    build.json.result.assets.some((f) => /\.js$/.test(f));
+
+  if (DEV) {
+    // RUNG 3 (dev server) + RUNG 4 (browser proof): scaffold the dev probe, boot the
+    // persistent vite-dev child + warm the optimizer, then leave miniflare listening on a
+    // real port so a browser (Playwright) can use the in-isolate vite dev server.
+    await call("/scaffold-dev-probe", "SCAFFOLD vite-dev probe into /tmp/proj", 60000);
+    const warm = await call("/dev-warmup", "DEV WARMUP: boot vite dev server in child + prebundle deps", 300000);
+    const devUrl = `http://127.0.0.1:${PORT}/`;
+    if (warm.json?.result?.ok) {
+      console.log(`\n  ➜  vite dev server (running from /tmp in a DO child) is live:`);
+      console.log(`  ➜  Local:   ${devUrl}`);
+      console.log(`\n  Open the URL above in a browser. The process stays up; Ctrl-C to stop.\n`);
+      ok = true;
+      // Keep the process alive for the browser.
+      await new Promise(() => {});
+    } else {
+      console.error("dev warmup failed; not serving.");
+    }
+  } else {
+    ok = rd.status === 200 && /OK chunks=/.test(JSON.stringify(rd.json?.result?.build ?? "")) && buildOk;
+  }
 } catch (e) {
   console.error("\nERROR:", e?.stack ?? String(e));
 } finally {
-  await mf.dispose();
+  if (!DEV) await mf.dispose();
 }
 process.exit(ok ? 0 : 1);

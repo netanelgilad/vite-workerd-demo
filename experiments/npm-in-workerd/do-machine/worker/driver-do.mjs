@@ -11,7 +11,7 @@
 import { Buffer } from "node:buffer";
 import * as nodeFs from "node:fs";
 
-import { transformTree } from "../transform-tmp.mjs";
+import { rewriteSource, transformTree } from "../transform-tmp.mjs";
 
 const ARBORIST = "/tmp/xnm/npm/node_modules/@npmcli/arborist/lib/index.js";
 const PROJ = "/tmp/proj";
@@ -109,6 +109,32 @@ const CHILD_GLOBALS_PRELUDE = `
       _WA.__patchedForUnsafeEval = true;
     }
   }
+  // BLOCKER FIX (native node:fs over workerd): openSync(missing, O_RDONLY) does NOT
+  // throw ENOENT in the child's native fs -- it returns a valid fd and fd_read yields
+  // 0 bytes, so rolldown's oxc_resolver reads a missing package.json as "" -> JSONError
+  // "File is empty" while walking dirs for resolution. rolldown's WASI fs (the @tybys
+  // preview1 shim) drives path_open/fd_read over globalThis.__ROLLDOWN_FS; its handleError
+  // maps a thrown {code:'ENOENT'} to WasiErrno.ENOENT. So surface ENOENT here for
+  // read-only opens (and stat/read) of non-existent paths -- the (a) "purer" fix: make the
+  // WASI fd/path ops signal ENOENT over native fs. Skip when O_CREAT is set so genuine
+  // create opens still work. (memfs would also give ENOENT; this keeps the bundler I/O on
+  // the real native /tmp the rest of the toolchain reads from.)
+  function makeEnoentFs(base) {
+    const O_CREAT = 0o100; // linux value used by @tybys FileControlFlag.O_CREAT
+    const enoent = (p, syscall) => { const e = new Error("ENOENT: no such file or directory, " + syscall + " '" + p + "'"); e.code = "ENOENT"; e.errno = -2; e.syscall = syscall; e.path = p; throw e; };
+    return new Proxy(base, { get(t, k) {
+      const v = t[k];
+      if (k === "openSync") return (p, flags, ...a) => {
+        const wantsCreate = typeof flags === "number" && (flags & O_CREAT) !== 0;
+        if (!wantsCreate && !t.existsSync(p)) enoent(p, "open");
+        return v.call(t, p, flags, ...a);
+      };
+      if (k === "readFileSync") return (p, ...a) => { if (!t.existsSync(p)) enoent(p, "open"); return v.call(t, p, ...a); };
+      if (k === "statSync") return (p, ...a) => { if (!t.existsSync(p)) enoent(p, "stat"); return v.call(t, p, ...a); };
+      if (k === "lstatSync") return (p, ...a) => { if (!t.existsSync(p)) enoent(p, "lstat"); return v.call(t, p, ...a); };
+      return typeof v === "function" ? v.bind(t) : v;
+    }});
+  }
 `;
 
 function viteChild() {
@@ -152,6 +178,23 @@ function viteBuildChild() {
     mainModule: "main.js",
     modules: {
       "main.js": `export { default } from "/tmp/proj/vite-build-probe.mjs";`,
+    },
+  };
+}
+
+function viteDevChild(devPort) {
+  return {
+    compatibilityDate: CHILD_COMPAT_DATE,
+    compatibilityFlags: CHILD_FLAGS,
+    allowExperimental: true,
+    shareParentTmp: true,
+    vfsModuleFallback: true,
+    // DEV_PORT lets the in-child vite tell the browser's HMR client which port to dial
+    // (the browser is on the miniflare port, not vite's default 5173).
+    env: { DEV_PORT: String(devPort ?? "") },
+    mainModule: "main.js",
+    modules: {
+      "main.js": `export { default } from "/tmp/proj/vite-dev-probe.mjs";`,
     },
   };
 }
@@ -307,7 +350,24 @@ export class NpmChildRunner {
         // POST-INSTALL TRANSFORM PASS over /tmp/proj/node_modules.
         const t0 = Date.now();
         const stats = transformTree(PROJ + "/node_modules", { fs });
-        return Response.json({ ok: true, op: "transform", ms: Date.now() - t0, ...stats });
+        // Also bake import.meta.* in the app's OWN root config files (postcss.config.js,
+        // tailwind.config.js, vite.config.*). They live in /tmp/proj (not node_modules)
+        // and are loaded by vite/postcss in the WASI bundler context where workerd gives
+        // import.meta.url === undefined -> fileURLToPath(undefined) throws. transformTree
+        // skips them (it only walks node_modules), so rewrite the root configs by hand.
+        const rootConfigs = [];
+        for (const name of fs.readdirSync(PROJ)) {
+          if (!/\.(js|mjs|cjs|ts|mts|cts)$/.test(name)) continue;
+          if (!/config/.test(name)) continue;
+          const p = PROJ + "/" + name;
+          let src;
+          try { src = fs.readFileSync(p, "utf8"); } catch { continue; }
+          if (!/import\.meta\.(url|dirname|filename)/.test(src)) continue;
+          const fmt = name.endsWith(".cjs") ? "cjs" : "esm";
+          const out = rewriteSource(src, p, fmt);
+          if (out !== src) { fs.writeFileSync(p, out); rootConfigs.push(name); }
+        }
+        return Response.json({ ok: true, op: "transform", ms: Date.now() - t0, ...stats, rootConfigs });
       }
 
       if (url.pathname === "/run-child") {
@@ -441,15 +501,16 @@ export class NpmChildRunner {
               // JSONError) instead of ENOENT (memfs, which the harness uses, returns ENOENT). Wrap
               // node:fs so stat/read of a non-existent path throws an ENOENT-coded error, giving the
               // WASI shim the not-found signal it expects.
-              const enoent = (p) => { const e = new Error("ENOENT: no such file or directory, '" + p + "'"); e.code = "ENOENT"; e.errno = -2; throw e; };
-              const wrapFs = (base) => new Proxy(base, { get(t, k) {
-                const v = t[k];
-                if (k === "readFileSync") return (p, ...a) => { if (!t.existsSync(p)) enoent(p); return v.call(t, p, ...a); };
-                if (k === "statSync") return (p, ...a) => { if (!t.existsSync(p)) enoent(p); return v.call(t, p, ...a); };
-                if (k === "lstatSync") return (p, ...a) => { if (!t.existsSync(p)) enoent(p); return v.call(t, p, ...a); };
-                return typeof v === "function" ? v.bind(t) : v;
-              }});
-              globalThis.__ROLLDOWN_FS = wrapFs(nodeFs);
+              // BLOCKER FIX (native node:fs over workerd): openSync(missing, O_RDONLY)
+              // does NOT throw ENOENT in the child's native fs -- it returns a valid fd
+              // and fd_read yields 0 bytes, so rolldown's oxc_resolver reads a missing
+              // package.json as "" -> JSONError "File is empty" while walking dirs. WASI's
+              // path_open (@tybys preview1) calls fs.openSync with low-level O_* flags; the
+              // shim's handleError maps a thrown {code:'ENOENT'} to WasiErrno.ENOENT. So
+              // surface ENOENT here for read-only opens of non-existent paths (skip when
+              // O_CREAT is set so genuine create opens still work). This is the (a) "purer"
+              // fix from the task: make the WASI fd/path op signal ENOENT over native fs.
+              globalThis.__ROLLDOWN_FS = makeEnoentFs(nodeFs);
               globalThis.__WAIT_UNTIL = (p) => { try { this.ctx.waitUntil(p); } catch {} };
               try { globalThis.__ROLLDOWN_WASM_BYTES = nodeFs.readFileSync("/tmp/proj/rolldown.wasm"); }
               catch (e) { out.wasmRead = "ERR " + String(e); return out; }
@@ -486,7 +547,7 @@ export class NpmChildRunner {
                   out.indexHtmlLen = html.length;
                   out.indexHtmlHead = html.slice(0, 200);
                 } catch (e) { out.indexHtml = "ERR " + String(e); }
-              } catch (e) { out.viteBuild = "ERR " + (e && e.stack ? String(e.stack).split("\\n").slice(0,10).join(" | ") : String(e)); }
+              } catch (e) { out.viteBuild = "ERR " + (e && e.stack ? String(e.stack).split("\\n").slice(0,16).join(" | ") : String(e)); }
               return out;
             }
           }
@@ -496,6 +557,68 @@ export class NpmChildRunner {
         const ep = child.getEntrypoint();
         const result = await ep.run();
         return Response.json({ ok: true, op: "run-vite-build", result });
+      }
+
+      if (url.pathname === "/scaffold-dev-probe") {
+        // Write the dev-server probe into /tmp/proj (so bare specifiers resolve against
+        // /tmp/proj/node_modules), fetched from the host service.
+        const t0 = Date.now();
+        const res = await this.env.HOST.fetch("http://host/dev-probe");
+        const src = await res.text();
+        fs.writeFileSync(PROJ + "/vite-dev-probe.mjs", src);
+        return Response.json({ ok: true, op: "scaffold-dev-probe", ms: Date.now() - t0, bytes: src.length });
+      }
+
+      if (url.pathname === "/dev-warmup") {
+        // Boot the persistent vite-dev child + warm the dep optimizer to completion.
+        const t0 = Date.now();
+        const child = this.env.LOADER.get("vite-dev-child", () => viteDevChild(this.env.DEV_PORT));
+        const ep = child.getEntrypoint();
+        const result = await ep.warmup();
+        if (result?.ok) this.devReady = true;
+        return Response.json({ ok: true, op: "dev-warmup", ms: Date.now() - t0, result });
+      }
+
+
+      if (url.pathname === "/fs-caps") {
+        // Probe the exact native-fs ops vite's dep-optimizer commit relies on.
+        const out = {};
+        const base = "/tmp/fscap";
+        try { fs.rmSync(base, { recursive: true, force: true }); } catch {}
+        // rm of a missing path with force:true
+        try { fs.rmSync(base + "/missing", { recursive: true, force: true }); out.rmMissingForce = "ok (no throw)"; }
+        catch (e) { out.rmMissingForce = "THROW " + e.code; }
+        // rm of a missing path WITHOUT force (vite loadCachedDepOptimizationMetadata)
+        try { fs.rmSync(base + "/missing2", { recursive: true }); out.rmMissingNoForce = "ok (no throw)"; }
+        catch (e) { out.rmMissingNoForce = "THROW " + e.code; }
+        // directory rename (the optimizer commit: processing -> deps)
+        try {
+          fs.mkdirSync(base + "/src/sub", { recursive: true });
+          fs.writeFileSync(base + "/src/a.js", "export const x=1;");
+          fs.renameSync(base + "/src", base + "/dst");
+          out.dirRename = fs.existsSync(base + "/dst/a.js") ? "ok" : "moved-but-missing-file";
+        } catch (e) { out.dirRename = "THROW " + e.code + " " + e.message.slice(0, 80); }
+        // rename when destination already exists (rename deps -> temp, then processing -> deps)
+        try {
+          fs.mkdirSync(base + "/d1", { recursive: true });
+          fs.mkdirSync(base + "/d2", { recursive: true });
+          fs.writeFileSync(base + "/d2/b.js", "1");
+          fs.renameSync(base + "/d1", base + "/d1_tmp");
+          fs.renameSync(base + "/d2", base + "/d1");
+          out.renameSwap = fs.existsSync(base + "/d1/b.js") ? "ok" : "swapped-but-missing";
+        } catch (e) { out.renameSwap = "THROW " + e.code + " " + e.message.slice(0, 80); }
+        try { fs.rmSync(base, { recursive: true, force: true }); } catch {}
+        return Response.json(out);
+      }
+
+      if (url.pathname === "/dev-deps-state") {
+        const viteDir = PROJ + "/node_modules/.vite";
+        const out = {};
+        const ls = (p) => { try { return fs.readdirSync(p); } catch (e) { return "ERR " + String(e); } };
+        out.viteDir = ls(viteDir);
+        out.deps = ls(viteDir + "/deps");
+        try { out.metadata = JSON.parse(fs.readFileSync(viteDir + "/deps/_metadata.json", "utf8")); } catch (e) { out.metadata = "ERR " + String(e); }
+        return Response.json(out);
       }
 
       if (url.pathname === "/diag") {
@@ -514,7 +637,19 @@ export class NpmChildRunner {
         });
       }
 
-      return new Response("ops: /install  /transform  /run-child  /diag", { status: 404 });
+      // BROWSER-FACING dev server (catch-all). Once the vite-dev child is warmed, any path
+      // that isn't a control op above is the browser using the app: "/", "/src/main.tsx",
+      // "/node_modules/.vite/deps/*", "/@vite/client", the "/__hmr" WebSocket, etc. Forward
+      // it verbatim to the persistent vite-dev child's fetch over RPC; the child runs vite
+      // (loaded from /tmp) in middleware mode + the WebSocketPair-backed HMR transport.
+      if (this.devReady) {
+        const child = this.env.LOADER.get("vite-dev-child", () => viteDevChild(this.env.DEV_PORT));
+        const ep = child.getEntrypoint();
+        const fwd = new Request(new URL(url.pathname + url.search, "http://vite.local"), request);
+        return await ep.fetch(fwd);
+      }
+
+      return new Response("ops: /install /transform /run-vite-build /scaffold-dev-probe /dev-warmup /diag", { status: 404 });
     } catch (e) {
       return Response.json(
         { ok: false, error: String(e), stack: (e?.stack ?? "").split("\n").slice(0, 50) },
