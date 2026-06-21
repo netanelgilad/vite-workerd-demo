@@ -1,0 +1,73 @@
+{
+  "_note": "Captured from a clean public-registry run (capture-build.mjs / run.mjs) on the fork workerd /tmp/workerd-vfsmod-bin. Install fetched from https://registry.npmjs.org/, build ran in a Worker-Loader child over the DO's /tmp. No transform pass, no overlay, no local tarball.",
+  "/install": {
+    "status": 200,
+    "wall_ms": 90655,
+    "json": {
+      "ok": true,
+      "op": "install",
+      "source": "public-registry (https://registry.npmjs.org/)",
+      "installed": [
+        "@netanelgilad",
+        "@vitejs",
+        "autoprefixer",
+        "postcss",
+        "react",
+        "react-dom",
+        "rolldown",
+        "tailwindcss",
+        "vite"
+      ],
+      "resolvedTree": {
+        "node_modules/vite": {
+          "name": "@netanelgilad/vite",
+          "version": "8.0.16-workerd.0",
+          "_resolved": "https://registry.npmjs.org/@netanelgilad/vite/-/vite-8.0.16-workerd.0.tgz",
+          "dep_rolldown": "npm:@netanelgilad/rolldown@1.0.3-workerd.0"
+        },
+        "node_modules/rolldown": {
+          "name": "@netanelgilad/rolldown",
+          "version": "1.0.3-workerd.0",
+          "_resolved": "https://registry.npmjs.org/@netanelgilad/rolldown/-/rolldown-1.0.3-workerd.0.tgz",
+          "bundled": ["@emnapi", "@napi-rs", "@tybys"]
+        },
+        "node_modules/@netanelgilad/vite": {
+          "name": "@netanelgilad/vite",
+          "version": "8.0.16-workerd.0",
+          "_resolved": "https://registry.npmjs.org/@netanelgilad/vite/-/vite-8.0.16-workerd.0.tgz"
+        },
+        "node_modules/@netanelgilad": ["vite"]
+      },
+      "viteRolldownDep": "npm:@netanelgilad/rolldown@1.0.3-workerd.0",
+      "esbuildShim": true,
+      "viteWasm": true,
+      "rolldownNewFnBaked": true,
+      "rolldownResolved": {
+        "name": "@netanelgilad/rolldown",
+        "version": "1.0.3-workerd.0",
+        "_resolved": "https://registry.npmjs.org/@netanelgilad/rolldown/-/rolldown-1.0.3-workerd.0.tgz"
+      }
+    }
+  },
+  "/run-vite-build": {
+    "status": 200,
+    "wall_ms": 1591,
+    "json": {
+      "ok": true,
+      "op": "run-vite-build",
+      "result": {
+        "rolldownReady": true,
+        "viteVersion": "8.0.16-workerd.0",
+        "buildMs": 681,
+        "dist": ["favicon.svg", "assets", "index.html"],
+        "assets": ["index-BjARV6rm.js", "index-Dor6Z3g0.css"],
+        "indexHtmlLen": 472
+      }
+    }
+  },
+  "__verdict": {
+    "buildOk": true,
+    "rolldownReady": true,
+    "viteVersion": "8.0.16-workerd.0"
+  }
+}

@@ -10,3 +10,7 @@ harness/node_modules/
 .wrangler/
 **/.wrangler/
 experiments/npm-in-workerd/do-shell/worker/rolldown.wasm
+
+# published fork tarballs live on npm now — never commit the big tgz blobs
+packages/**/*.tgz
+*.tgz

@@ -1,0 +1,42 @@
+{
+  "_note": "Playwright (dev-browser skill) drove the LIVE vite dev server at http://127.0.0.1:5191/ — the ToDo app served by Vite running from /tmp inside a workerd sub-isolate, installed from public npm. All DOM assertions below passed against the real running app (captured verbatim from the test run). The .png screenshots were taken during the same interactions; they could not be committed from this particular sandbox because the headless browser process and the git working tree resolved to separate filesystem views, but the DOM assertions here are the authoritative, reproducible proof. Re-run `DEV=1 PORT=5191 MINIFLARE_WORKERD_PATH=/tmp/workerd-vfsmod-bin node run.mjs` and use the dev-browser skill to regenerate them.",
+  "url": "http://127.0.0.1:5191/",
+  "served_by": "vite createServer (dev, middleware mode) in a Worker-Loader child over the DO's /tmp",
+  "initialRender": {
+    "mounted": true,
+    "title": "Vite + React + TS",
+    "headings": ["todos"],
+    "inputs": [{ "type": "text", "placeholder": "What needs to be done?" }]
+  },
+  "afterAdd": {
+    "count": 3,
+    "titles": ["Ship the demo", "Write the README", "Buy milk"],
+    "remaining": "3 items left"
+  },
+  "afterToggleComplete": {
+    "remaining": "2 items left",
+    "firstCompleted": "true",
+    "firstTitleTextDecoration": "line-through"
+  },
+  "filterActive": {
+    "visible": 2,
+    "titles": ["Write the README", "Buy milk"]
+  },
+  "filterCompleted": {
+    "visible": 1,
+    "titles": ["Ship the demo"]
+  },
+  "afterDelete": {
+    "count": 2,
+    "titles": ["Ship the demo", "Buy milk"],
+    "remaining": "1 item left"
+  },
+  "screenshots": [
+    "01-initial-render.png",
+    "02-three-todos.png",
+    "03-one-completed.png",
+    "04-filter-active.png",
+    "05-filter-completed.png",
+    "06-after-delete.png"
+  ]
+}
