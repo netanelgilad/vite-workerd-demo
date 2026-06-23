@@ -144,7 +144,13 @@ function rewriteSource(src, virtPath, format) {
   // route node:process / process to the shim (require('node:process') segfaults workerd)
   const importSite = (spec) =>
     new RegExp(String.raw`(\bfrom\s*|\bimport\s*\(\s*|\b__require\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)(["'])${spec.replace(/[/\\]/g, "\\$&")}\2`, "gm");
-  for (const [spec, target] of [["node:process", "/tmp/shims/process.cjs"], ["process", "/tmp/shims/process.cjs"]]) {
+  for (const [spec, target] of [
+    ["node:process", "/tmp/shims/process.cjs"], ["process", "/tmp/shims/process.cjs"],
+    // workerd resolves node builtins internally (never via the fallback) and its native
+    // child_process.spawn throws; rewrite the specifier to a shim that maps spawn() onto
+    // an isolate-spawn over /tmp (globalThis.__ISOLATE_SPAWN). Lets real `npm create/exec` run.
+    ["node:child_process", "/tmp/shims/child_process.cjs"], ["child_process", "/tmp/shims/child_process.cjs"],
+  ]) {
     src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
   }
   return src;

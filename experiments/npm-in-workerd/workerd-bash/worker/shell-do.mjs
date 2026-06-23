@@ -7,7 +7,10 @@
 //   - `npm install [pkgs...]` -> Arborist install into /tmp/proj/node_modules from
 //     the PUBLIC registry. Default (no args) installs @netanelgilad/vite + the ToDo
 //     app's deps (the exact set do-machine-clean proved buildable/serveable).
-//   - `npm create` / `scaffold`         -> write the app-todo source into /tmp/proj.
+//   - `npm create <init>` / `npm exec` / `npx`  -> REAL libnpmexec: install the pkg via
+//     Arborist, then run its bin in a child over /tmp via the child_process->isolate
+//     spawn bridge (e.g. `npm create vite myapp -- --template react-ts`).
+//   - `scaffold`                         -> write the app-todo source into /tmp/proj.
 //   - `vite build`                       -> run vite build from /tmp in a child; list dist.
 //   - `vite dev` / `npm run dev`         -> boot the vite dev server in a child over /tmp,
 //                                           reachable on the bound miniflare port; print URL.
@@ -151,6 +154,144 @@ function viteDevChild(devPort) {
   };
 }
 
+// ---- child_process -> isolate-spawn bridge (makes REAL `npm create/exec/npx` work) ----
+const NPXCACHE = "/tmp/npxcache";
+
+function nodeProcessChild(probePath) {
+  return {
+    compatibilityDate: CHILD_COMPAT_DATE,
+    compatibilityFlags: CHILD_FLAGS,
+    allowExperimental: true,
+    shareParentTmp: true,
+    vfsModuleFallback: true,
+    mainModule: "main.js",
+    modules: { "main.js": `export { default } from ${JSON.stringify(probePath)};` },
+  };
+}
+
+function tokenize(line) {
+  const out = [];
+  let cur = "", q = null, has = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (q) {
+      if (ch === q) q = null;
+      else if (q === '"' && ch === "\\" && i + 1 < line.length) cur += line[++i];
+      else cur += ch;
+    } else if (ch === "'" || ch === '"') { q = ch; has = true; }
+    else if (ch === "\\" && i + 1 < line.length) { cur += line[++i]; has = true; }
+    else if (ch === " " || ch === "\t" || ch === "\n") { if (has || cur) { out.push(cur); cur = ""; has = false; } }
+    else { cur += ch; has = true; }
+  }
+  if (has || cur) out.push(cur);
+  return out;
+}
+
+// promise-spawn calls spawn('sh', ['-c', line], opts).
+function resolveArgv(file, args = []) {
+  const base = String(file || "").split("/").pop();
+  if ((base === "sh" || base === "bash" || base === "zsh") && args[0] === "-c") return tokenize(args[1] || "");
+  if ((base === "cmd" || base === "cmd.exe") && args.includes("/c")) return tokenize(args[args.indexOf("/c") + 1] || "");
+  return [file, ...args];
+}
+
+function realOrSelf(fs, p) { try { return fs.realpathSync(p); } catch { return p; } }
+
+function resolveBinToJs(fs, cmd, options) {
+  if (cmd.startsWith("/") && fs.existsSync(cmd)) return realOrSelf(fs, cmd);
+  const env = options.env || {};
+  const dirs = String(env.PATH || env.Path || "").split(":").filter(Boolean);
+  for (const dir of dirs) {
+    const cand = dir + "/" + cmd;
+    try { if (fs.existsSync(cand)) return realOrSelf(fs, cand); } catch {}
+  }
+  for (const dir of dirs) {
+    if (!dir.endsWith("/.bin")) continue;
+    const hit = scanNmForBin(fs, dir.slice(0, -"/.bin".length), cmd);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function scanNmForBin(fs, nm, cmd) {
+  let names = [];
+  try { names = fs.readdirSync(nm); } catch { return null; }
+  const pkgDirs = [];
+  for (const n of names) {
+    if (n.startsWith("@")) { try { for (const s of fs.readdirSync(nm + "/" + n)) pkgDirs.push(n + "/" + s); } catch {} }
+    else pkgDirs.push(n);
+  }
+  for (const d of pkgDirs) {
+    let pkg;
+    try { pkg = JSON.parse(fs.readFileSync(nm + "/" + d + "/package.json", "utf8")); } catch { continue; }
+    const bin = pkg.bin, shortName = String(pkg.name || "").split("/").pop();
+    if (typeof bin === "string" && (pkg.name === cmd || shortName === cmd)) return nm + "/" + d + "/" + bin.replace(/^\.\//, "");
+    if (bin && typeof bin === "object" && bin[cmd]) return nm + "/" + d + "/" + String(bin[cmd]).replace(/^\.\//, "");
+  }
+  return null;
+}
+
+function probeSrc(entry, args, cwd, envObj) {
+  return `
+  import { WorkerEntrypoint } from "cloudflare:workers";
+  export default class extends WorkerEntrypoint {
+    async run() {
+      const ENTRY = ${JSON.stringify(entry)};
+      const ARGV = ${JSON.stringify(["node", entry, ...args])};
+      const CWD = ${JSON.stringify(cwd)};
+      const ENV = ${JSON.stringify(envObj)};
+      const out = [], err = [];
+      const now = () => Date.now();
+      let last = now();
+      const np = await import("node:process");
+      for (const proc of new Set([np.default, np, globalThis.process].filter(Boolean))) {
+        try { proc.argv = ARGV.slice(); } catch {}
+        try { proc.cwd = () => CWD; } catch { try { Object.defineProperty(proc, "cwd", { configurable: true, value: () => CWD }); } catch {} }
+        try { proc.env = Object.assign(proc.env || {}, ENV); } catch {}
+        try { if (proc.stdin) proc.stdin.isTTY = false; } catch {}
+      }
+      let exitCode = null;
+      try { np.default.exit = (c) => { exitCode = (c == null ? 0 : c); throw { __ISOLATE_EXIT__: exitCode }; }; } catch {}
+      const enc = (a) => a.map((x) => typeof x === "string" ? x : (() => { try { return JSON.stringify(x); } catch { return String(x); } })()).join(" ");
+      const oLog = console.log, oErr = console.error, oWarn = console.warn, oInfo = console.info;
+      console.log = (...a) => { last = now(); out.push(enc(a) + "\\n"); };
+      console.info = (...a) => { last = now(); out.push(enc(a) + "\\n"); };
+      console.warn = (...a) => { last = now(); err.push(enc(a) + "\\n"); };
+      console.error = (...a) => { last = now(); err.push(enc(a) + "\\n"); };
+      try { np.default.stdout.write = (s) => { last = now(); out.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
+      try { np.default.stderr.write = (s) => { last = now(); err.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
+      let importErr = null;
+      last = now();
+      try { await import(ENTRY); }
+      catch (e) {
+        if (e && typeof e === "object" && "__ISOLATE_EXIT__" in e) exitCode = e.__ISOLATE_EXIT__;
+        else importErr = String(e && e.stack || e);
+      }
+      const QUIET = 800, MAX = 60000, t0 = now();
+      while (exitCode === null && (now() - t0) < MAX) {
+        if (now() - last > QUIET) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      console.log = oLog; console.error = oErr; console.warn = oWarn; console.info = oInfo;
+      return { code: exitCode == null ? 0 : exitCode, signal: null, stdout: out.join(""), stderr: err.join(""), importErr };
+    }
+  }
+  `;
+}
+
+// `npm create <initializer>` -> the create-* package npm would exec.
+function initToCreatePkg(spec) {
+  const at = spec.lastIndexOf("@");
+  let name = spec, version = "";
+  if (at > 0) { name = spec.slice(0, at); version = spec.slice(at); }
+  let pkg;
+  if (name.startsWith("@")) {
+    const [scope, rest] = name.split("/");
+    pkg = rest ? `${scope}/create-${rest}` : `${scope}/create`;
+  } else pkg = `create-${name}`;
+  return { spec: pkg + version, bin: pkg };
+}
+
 export class Shell {
   constructor(state, env) { this.state = state; this.env = env; }
 
@@ -185,6 +326,117 @@ export class Shell {
     let installed = [];
     try { installed = fs.readdirSync(PROJ + "/node_modules").filter((n) => !n.startsWith(".")); } catch {}
     return { ms: Date.now() - t0, installed, deps: Object.keys(deps) };
+  }
+
+  // Install the child_process -> isolate-spawn bridge. The host rewrites npm's
+  // `require('child_process')` to a shim that delegates here; we resolve the bin to a
+  // JS entry and run it in a Worker-Loader child over the shared /tmp.
+  installIsolateSpawn() {
+    const self = this;
+    const fs = nodeFs;
+    globalThis.__SPAWN_LOG = globalThis.__SPAWN_LOG || [];
+    globalThis.__ISOLATE_SPAWN = async (file, args, options = {}) => {
+      const argv = resolveArgv(file, args);
+      const cmd = argv[0];
+      const entry = resolveBinToJs(fs, cmd, options);
+      if (!entry) throw new Error("isolate-spawn: cannot resolve '" + cmd + "' (PATH=" + (options.env?.PATH || "") + ")");
+      const res = await self.runNodeChild(entry, argv.slice(1), options);
+      if (res?.stdout) globalThis.__SPAWN_LOG.push(res.stdout);
+      if (res?.stderr) globalThis.__SPAWN_LOG.push(res.stderr);
+      return res;
+    };
+  }
+
+  async runNodeChild(entry, args, options) {
+    const fs = nodeFs;
+    // Replicate Node's shebang stripping (workerd's loader treats a leading `#!` as a
+    // syntax error). Strip into a sibling so package type / relative imports / import.meta
+    // dir are unchanged.
+    let realEntry = entry;
+    try {
+      const head = fs.readFileSync(entry, "utf8");
+      if (head.startsWith("#!")) {
+        const slash = entry.lastIndexOf("/");
+        realEntry = entry.slice(0, slash + 1) + "__nosheb_" + entry.slice(slash + 1);
+        fs.writeFileSync(realEntry, head.replace(/^#![^\n]*\n/, "//\n"));
+      }
+    } catch {}
+    const n = (globalThis.__SPAWN_N = (globalThis.__SPAWN_N || 0) + 1);
+    const probePath = "/tmp/__spawn_probe_" + n + ".mjs";
+    fs.writeFileSync(probePath, probeSrc(realEntry, args, options.cwd || PROJ, options.env || {}));
+    const child = this.env.LOADER.get("isolate-spawn-" + n, () => nodeProcessChild(probePath));
+    return await child.getEntrypoint().run();
+  }
+
+  // The REAL `npm create`/`npm exec`/`npx`: drive libnpmexec.exec UNMODIFIED. It
+  // resolves+installs the package via Arborist, then spawns its bin -> our child_process
+  // shim runs the real bin in a child over the shared /tmp.
+  async execNpm(kind, rawArgs, cwd) {
+    await patchProcessReport();
+    this.installIsolateSpawn();
+    globalThis.__SPAWN_LOG = [];
+    const fs = nodeFs;
+    const runPath = cwd || PROJ;
+    const args = rawArgs.filter((a) => a !== "--");
+    let packages = [], execArgs = [];
+    if (kind === "create") {
+      if (!args.length) throw new Error("usage: npm create <initializer> [args]");
+      const { spec, bin } = initToCreatePkg(args[0]);
+      packages = [spec];
+      execArgs = [bin, ...args.slice(1)];
+    } else {
+      if (!args.length) throw new Error("usage: " + (kind === "npx" ? "npx" : "npm exec") + " <pkg> [args]");
+      execArgs = args.slice();
+    }
+    fs.mkdirSync(runPath, { recursive: true });
+    fs.mkdirSync(NPXCACHE, { recursive: true });
+    fs.mkdirSync(CACHE, { recursive: true });
+    const mod = await import("/tmp/xnm/npm/node_modules/libnpmexec/lib/index.js");
+    const libexec = mod.default || mod;
+    await libexec({
+      args: execArgs,
+      packages,
+      path: runPath,
+      runPath,
+      yes: true,
+      localBin: runPath + "/node_modules/.bin",
+      globalBin: "",
+      scriptShell: "sh",
+      registry: "https://registry.npmjs.org/",
+      cache: CACHE,
+      npxCache: NPXCACHE,
+      // Accommodations a real Node provides for free (none alter npm/bin logic):
+      packumentCache: new Map(),
+      nodeGyp: "/tmp/xnm/npm/node_modules/node-gyp/bin/node-gyp.js",
+      env: { PATH: "/usr/bin:/bin" },
+      chalk: { reset: (s) => s, dim: (s) => s, bold: (s) => s },
+    });
+    // The bin ran in a spawn child (shareParentTmp); files it created carry the child
+    // isolate's node, and a later in-place write from this (parent) isolate trips a
+    // workerd shared-VFS assertion (read is fine; in-place open-for-write crashes). Re-own
+    // the scaffolded tree (read -> rm -> rewrite from here) so files are parent-owned and
+    // editable with `sed -i` / `>` directly.
+    if (kind === "create") {
+      const targetName = args.slice(1).find((a) => !a.startsWith("-"));
+      const targetDir = !targetName || targetName === "." ? runPath : runPath + "/" + targetName;
+      try { this.reownTree(fs, targetDir); } catch {}
+    }
+    return { ok: true, spawnLog: (globalThis.__SPAWN_LOG || []).join("") };
+  }
+
+  // Re-materialize every file under dir from this (parent) isolate so subsequent in-place
+  // writes don't hit the child-created-node assertion. read+rm+write is the proven-safe
+  // sequence (a direct in-place overwrite of a child file crashes).
+  reownTree(fs, dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = dir + "/" + e.name;
+      if (e.isDirectory()) this.reownTree(fs, p);
+      else if (e.isFile()) {
+        const buf = fs.readFileSync(p);
+        fs.rmSync(p);
+        fs.writeFileSync(p, buf);
+      }
+    }
   }
 
   async scaffoldApp() {
@@ -325,9 +577,22 @@ export class Shell {
         } catch { return { stdout: "(no node_modules — run `npm install`)\n", stderr: "", exitCode: 0 }; }
       }
       if (sub === "run" && args[1] === "dev") return runViteDev();
-      if (sub === "create") return doScaffold();
-      return { stdout: "", stderr: `npm: supported here — install [pkgs], ls, run dev, create (got: ${args.join(" ")})\n`, exitCode: 2 };
+      if (sub === "create" || sub === "init") return execNpmCmd("create", args.slice(1), ctx);
+      if (sub === "exec") return execNpmCmd("exec", args.slice(1), ctx);
+      return { stdout: "", stderr: `npm: supported here — install [pkgs], ls, run dev, create <initializer>, exec <pkg> (got: ${args.join(" ")})\n`, exitCode: 2 };
     });
+
+    // Real `npm create`/`npm exec`/`npx` via libnpmexec + the child_process->isolate bridge.
+    const execNpmCmd = async (kind, rest, ctx) => {
+      const label = kind === "create" ? "npm create" : kind === "npx" ? "npx" : "npm exec";
+      try {
+        const r = await self.execNpm(kind, rest, ctx?.cwd || PROJ);
+        return { stdout: (r.spawnLog || "") + "\n", stderr: "", exitCode: 0 };
+      } catch (e) {
+        return { stdout: "", stderr: `${label} failed: ${e?.stack ?? e}\n`, exitCode: 1 };
+      }
+    };
+    const npx = defineCommand("npx", async (args, ctx) => execNpmCmd("npx", args, ctx));
 
     const doScaffold = async () => {
       try {
@@ -379,7 +644,7 @@ export class Shell {
       return { stdout: "", stderr: `vite: supported here — build, dev (got: ${args.join(" ")})\n`, exitCode: 2 };
     });
 
-    for (const c of [npm, scaffold, vite]) bash.registerCommand(c);
+    for (const c of [npm, scaffold, vite, npx]) bash.registerCommand(c);
     this.bash = bash;
     return bash;
   }

@@ -165,6 +165,11 @@ function rewriteSource(src, virtPath, format) {
     // the specifier so workerd never sees it — the shim re-exports the global.
     ["node:process", "/tmp/shims/process.cjs"],
     ["process", "/tmp/shims/process.cjs"],
+    // workerd resolves node builtins internally (it never asks the fallback service),
+    // and its native child_process.spawn throws "not implemented". Rewrite the specifier
+    // so workerd never sees it — the shim maps spawn() onto an isolate-spawn over /tmp.
+    ["node:child_process", "/tmp/shims/child_process.cjs"],
+    ["child_process", "/tmp/shims/child_process.cjs"],
   ]) {
     src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
   }
@@ -194,6 +199,13 @@ export function moduleFallback(request) {
     // re-exports the global instead of the native module.
     if (builtinName === "process") {
       return new MfResponse(null, { status: 301, headers: { Location: "/tmp/shims/process.cjs" } });
+    }
+    // workerd has no process model, so node:child_process.spawn() throws. Route it to
+    // a shim that maps spawn() onto an isolate-spawn over the DO's shared /tmp (the
+    // shim delegates to globalThis.__ISOLATE_SPAWN, installed by the DO). This is the
+    // single missing OS primitive that lets real `npm exec` / `npm create` run here.
+    if (builtinName === "child_process") {
+      return new MfResponse(null, { status: 301, headers: { Location: "/tmp/shims/child_process.cjs" } });
     }
     // fs and fs/promises are now NATIVE — route them straight to workerd's builtin.
     if (/^(fs|fs\/promises|path|url|util|os|module|crypto|events|stream|buffer|assert|zlib|querystring|http|https|http2|net|tls|child_process|worker_threads|perf_hooks|readline|tty|v8|vm|string_decoder|constants|async_hooks|dns|inspector|timers|punycode|diagnostics_channel|sys|wasi)(\/|$)/.test(builtinName)) {
