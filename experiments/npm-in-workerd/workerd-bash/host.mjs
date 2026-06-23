@@ -286,6 +286,12 @@ function hostService(request) {
   if (url.pathname === "/dev-probe") {
     return new MfResponse(readFileSync(path.join(HERE, "worker/vite-dev-probe.mjs")), { headers: { "content-type": "text/javascript" } });
   }
+  if (url.pathname === "/realbin-probe") {
+    return new MfResponse(readFileSync(path.join(HERE, "worker/vite-realbin-probe.mjs")), { headers: { "content-type": "text/javascript" } });
+  }
+  if (url.pathname === "/vite-http-shim") {
+    return new MfResponse(readFileSync(path.join(HERE, "..", "shims-vite", "node-http.mjs")), { headers: { "content-type": "text/javascript" } });
+  }
   return new MfResponse("not found", { status: 404 });
 }
 

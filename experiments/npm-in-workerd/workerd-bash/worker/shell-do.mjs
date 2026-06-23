@@ -156,6 +156,45 @@ function viteDevChild(devPort) {
 
 // ---- child_process -> isolate-spawn bridge (makes REAL `npm create/exec/npx` work) ----
 const NPXCACHE = "/tmp/npxcache";
+const VSHIM_DIR = "/tmp/_vshims";
+const VHTTP_SHIM = VSHIM_DIR + "/node-http.mjs";
+// The probe lives INSIDE the project root so its bare imports ("rolldown", "vite") resolve
+// against <root>/node_modules.
+const probePathFor = (root) => root + "/.vite-realbin-probe.mjs";
+
+// A child that runs the REAL `vite` bin against `root` (whatever's in the pwd), honoring
+// the project's own vite.config. The node:http shim (which we redirect vite's import onto)
+// supplies the listening server; the probe dispatches browser HTTP into vite's connect app.
+function viteRealBinChild(devPort, bin, root) {
+  return {
+    compatibilityDate: CHILD_COMPAT_DATE,
+    compatibilityFlags: CHILD_FLAGS,
+    allowExperimental: true,
+    shareParentTmp: true,
+    vfsModuleFallback: true,
+    env: { DEV_PORT: String(devPort ?? ""), VITE_BIN: bin, VITE_ROOT: root },
+    mainModule: "main.js",
+    modules: {
+      "main.js": `
+        import { WorkerEntrypoint } from "cloudflare:workers";
+        let _impl;
+        async function impl() { if (!_impl) _impl = (await import(${JSON.stringify(probePathFor(root))})).default; return _impl; }
+        export default class extends WorkerEntrypoint {
+          async #inst() {
+            const I = await impl();
+            const ctx = this.ctx ?? { waitUntil() {}, passThroughOnException() {} };
+            if (!ctx.waitUntil) ctx.waitUntil = () => {};
+            const inst = new I(ctx, this.env);
+            inst.ctx = ctx; inst.env = this.env;
+            return inst;
+          }
+          async warmup() { return (await this.#inst()).warmup(); }
+          async fetch(request) { return (await this.#inst()).fetch(request); }
+        }
+      `,
+    },
+  };
+}
 
 function nodeProcessChild(probePath) {
   return {
@@ -301,31 +340,35 @@ export class Shell {
   // Faithful to `npm install <pkgs>`: Arborist resolves+fetches from
   // https://registry.npmjs.org/ over workerd native fs (the tar sync-extract
   // workaround in the module-fallback host makes this work).
-  async npmInstall(extraDeps) {
+  async npmInstall(extraDeps, root = PROJ) {
     await patchProcessReport();
     const fs = nodeFs;
-    fs.mkdirSync(PROJ, { recursive: true });
+    fs.mkdirSync(root, { recursive: true });
     fs.mkdirSync(CACHE, { recursive: true });
-    let pkg = { name: "scratch", version: "1.0.0", private: true, dependencies: {} };
-    try { pkg = JSON.parse(fs.readFileSync(PROJ + "/package.json", "utf8")); pkg.dependencies ??= {}; } catch {}
-    // No explicit pkgs -> install the default vite + ToDo set; else merge requested.
-    const deps = extraDeps && Object.keys(extraDeps).length ? extraDeps : DEFAULT_DEPS;
-    Object.assign(pkg.dependencies, deps);
-    fs.writeFileSync(PROJ + "/package.json", JSON.stringify(pkg, null, 2));
+    let pkg = { name: "scratch", version: "1.0.0", private: true, type: "module", dependencies: {} };
+    try { pkg = JSON.parse(fs.readFileSync(root + "/package.json", "utf8")); pkg.dependencies ??= {}; } catch {}
+    // Real `npm install` reifies the project's own package.json. We only inject the demo
+    // default set (fork vite + ToDo deps) when this is a BARE project with no deps of its
+    // own AND nothing was explicitly requested — otherwise we honor what's declared.
+    const declared = Object.keys(pkg.dependencies || {}).length + Object.keys(pkg.devDependencies || {}).length;
+    const explicit = extraDeps && Object.keys(extraDeps).length;
+    let deps = {};
+    if (explicit) { deps = extraDeps; Object.assign(pkg.dependencies, deps); fs.writeFileSync(root + "/package.json", JSON.stringify(pkg, null, 2)); }
+    else if (declared === 0) { deps = DEFAULT_DEPS; Object.assign(pkg.dependencies, deps); fs.writeFileSync(root + "/package.json", JSON.stringify(pkg, null, 2)); }
     const t0 = Date.now();
     const { default: Arborist } = await import(ARBORIST);
     const arb = new Arborist({
-      path: PROJ, cache: CACHE, registry: "https://registry.npmjs.org/",
+      path: root, cache: CACHE, registry: "https://registry.npmjs.org/",
       ignoreScripts: true, audit: false, fund: false, progress: false,
       packumentCache: new Map(),
-      // @vitejs/plugin-react@6 wants vite ^8.0.0; the fork's 8.0.16-workerd.0 is a
-      // prerelease that strict semver rejects — the canonical --legacy-peer-deps case.
+      // The fork's 8.0.16-workerd.0 is a prerelease that strict semver rejects against
+      // plugin peers — the canonical --legacy-peer-deps case a real user would also pass.
       legacyPeerDeps: true,
     });
     await arb.reify({ ignoreScripts: true, audit: false, legacyPeerDeps: true });
     let installed = [];
-    try { installed = fs.readdirSync(PROJ + "/node_modules").filter((n) => !n.startsWith(".")); } catch {}
-    return { ms: Date.now() - t0, installed, deps: Object.keys(deps) };
+    try { installed = fs.readdirSync(root + "/node_modules").filter((n) => !n.startsWith(".")); } catch {}
+    return { ms: Date.now() - t0, installed, deps: Object.keys(deps), root };
   }
 
   // Install the child_process -> isolate-spawn bridge. The host rewrites npm's
@@ -518,28 +561,53 @@ export class Shell {
     return await child.getEntrypoint().run();
   }
 
-  async devWarmup() {
-    const child = this.env.LOADER.get("workerd-bash-vite-dev", () => viteDevChild(this.env.DEV_PORT));
-    const result = await child.getEntrypoint().warmup();
-    if (result?.ok) this.devReady = true;
-    return result;
+  // ---- REAL vite bin dev server (cwd-driven) ----
+
+  // Supply the node:http primitive + redirect the project's vite onto it, write the probe,
+  // and resolve the real bin. Idempotent per root; returns the (shebang-stripped) bin path.
+  async setupRealVite(root) {
+    const fs = nodeFs;
+    // node:http shim (child-visible native /tmp), written once.
+    if (!fs.existsSync(VHTTP_SHIM)) {
+      fs.mkdirSync(VSHIM_DIR, { recursive: true });
+      fs.writeFileSync(VHTTP_SHIM, await (await this.env.HOST.fetch("http://host/vite-http-shim")).text());
+    }
+    const probePath = probePathFor(root);
+    if (!fs.existsSync(probePath)) {
+      fs.writeFileSync(probePath, await (await this.env.HOST.fetch("http://host/realbin-probe")).text());
+    }
+    // Redirect the installed vite's `import "node:http"` -> our shim (exact match leaves
+    // node:http2 untouched). Provides the listening-server primitive; vite logic untouched.
+    for (const f of [root + "/node_modules/vite/dist/node/chunks/node.js", root + "/node_modules/vite/dist/node/cli.js"]) {
+      try {
+        let src = fs.readFileSync(f, "utf8");
+        if (!/["']node:http["']/.test(src)) continue;
+        const out = src.replace(/(["'])node:http\1/g, JSON.stringify(VHTTP_SHIM));
+        if (out !== src) fs.writeFileSync(f, out);
+      } catch {}
+    }
+    // Resolve node_modules/vite's bin + shebang-strip (workerd's loader rejects a leading #!).
+    const pkg = JSON.parse(fs.readFileSync(root + "/node_modules/vite/package.json", "utf8"));
+    const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin.vite;
+    const binPath = root + "/node_modules/vite/" + rel.replace(/^\.\//, "");
+    const head = fs.readFileSync(binPath, "utf8");
+    if (head.startsWith("#!")) {
+      const slash = binPath.lastIndexOf("/");
+      const stripped = binPath.slice(0, slash + 1) + "__nosheb_" + binPath.slice(slash + 1);
+      fs.writeFileSync(stripped, head.replace(/^#![^\n]*\n/, "//\n"));
+      return stripped;
+    }
+    return binPath;
   }
 
-  // Self-heal: install (if missing) + scaffold app + dev probe + warm vite. Runs on
-  // the serve path too, because miniflare can route a port request to a DO instance
-  // whose /tmp didn't get the dispatchFetch-driven setup.
-  async ensureDevReady() {
-    if (this.devReady) return;
-    if (this._ensuring) return this._ensuring;
-    const fs = nodeFs;
-    this._ensuring = (async () => {
-      const rolldownBinding = PROJ + "/node_modules/rolldown/dist/rolldown-binding.wasi-browser.js";
-      if (!fs.existsSync(rolldownBinding)) await this.npmInstall();
-      if (!fs.existsSync(PROJ + "/src/main.tsx")) await this.scaffoldApp();
-      if (!fs.existsSync(PROJ + "/vite-dev-probe.mjs")) await this.scaffoldDevProbe();
-      await this.devWarmup();
-    })();
-    try { await this._ensuring; } finally { this._ensuring = null; }
+  // Boot the real-bin vite dev server for `root` and remember it for the browser path.
+  async bootRealVite(root) {
+    const bin = await this.setupRealVite(root);
+    const key = "vite-realbin:" + root;
+    const child = this.env.LOADER.get(key, () => viteRealBinChild(this.env.DEV_PORT, bin, root));
+    const result = await child.getEntrypoint().warmup();
+    if (result?.ok) { this.devReady = true; this.devRoot = root; this.devBin = bin; }
+    return result;
   }
 
   // ---- the interactive shell (just-bash + the toolchain commands) ----
@@ -555,15 +623,14 @@ export class Shell {
     // npm install [pkgs...] | npm ls | npm run dev
     const npm = defineCommand("npm", async (args, ctx) => {
       const sub = args[0];
+      const cwd = ctx?.cwd || PROJ;
       if (sub === "install" || sub === "i" || sub === "add") {
         const specs = args.slice(1).filter((a) => !a.startsWith("-"));
         let extra = null;
         if (specs.length) { extra = {}; for (const s of specs) { const name = s.replace(/@[^@]*$/, "") || s; extra[name] = s.slice(name.length + 1) || "*"; } }
         try {
-          const banner = extra
-            ? `npm install ${specs.join(" ")}  (Arborist -> /tmp/proj/node_modules, public registry)\n`
-            : `npm install  (default: @netanelgilad/vite + ToDo app deps from public registry; this can take a few minutes)\n`;
-          const r = await self.npmInstall(extra);
+          const banner = `npm install${specs.length ? " " + specs.join(" ") : ""}  (Arborist -> ${cwd}/node_modules, public registry; can take a few minutes)\n`;
+          const r = await self.npmInstall(extra, cwd);
           return { stdout: banner + `+ installed ${r.installed.length} packages in ${(r.ms / 1000).toFixed(1)}s\n` +
             `node_modules: ${r.installed.join(", ")}\n`, stderr: "", exitCode: 0 };
         } catch (e) {
@@ -572,11 +639,11 @@ export class Shell {
       }
       if (sub === "ls") {
         try {
-          const ns = nodeFs.readdirSync(PROJ + "/node_modules").filter((n) => !n.startsWith("."));
+          const ns = nodeFs.readdirSync(cwd + "/node_modules").filter((n) => !n.startsWith("."));
           return { stdout: ns.join("\n") + "\n", stderr: "", exitCode: 0 };
         } catch { return { stdout: "(no node_modules — run `npm install`)\n", stderr: "", exitCode: 0 }; }
       }
-      if (sub === "run" && args[1] === "dev") return runViteDev();
+      if (sub === "run" && args[1] === "dev") return runViteDev(cwd);
       if (sub === "create" || sub === "init") return execNpmCmd("create", args.slice(1), ctx);
       if (sub === "exec") return execNpmCmd("exec", args.slice(1), ctx);
       return { stdout: "", stderr: `npm: supported here — install [pkgs], ls, run dev, create <initializer>, exec <pkg> (got: ${args.join(" ")})\n`, exitCode: 2 };
@@ -602,30 +669,30 @@ export class Shell {
     };
     const scaffold = defineCommand("scaffold", doScaffold);
 
-    const runViteDev = async () => {
+    // Run the REAL vite bin against the current project dir (whatever's in the pwd),
+    // honoring its own vite.config. No hand-rolled createServer.
+    const runViteDev = async (root) => {
+      root = root || PROJ;
       if (!self.env.DEV_PORT) return { stdout: "", stderr: "vite dev needs a bound port (launch the REPL normally, not in --no-port mode)\n", exitCode: 1 };
       const url = `http://127.0.0.1:${self.env.DEV_PORT}/`;
       try {
         const fs = nodeFs;
-        if (!fs.existsSync(PROJ + "/node_modules/rolldown/dist/rolldown-binding.wasi-browser.js"))
-          return { stdout: "", stderr: "no vite installed — run `npm install` first\n", exitCode: 1 };
-        if (!fs.existsSync(PROJ + "/src/main.tsx")) await self.scaffoldApp();
-        if (!fs.existsSync(PROJ + "/vite-dev-probe.mjs")) await self.scaffoldDevProbe();
+        if (!fs.existsSync(root + "/node_modules/vite/package.json"))
+          return { stdout: "", stderr: `no vite installed in ${root} — run \`npm install\` first\n`, exitCode: 1 };
         const t0 = Date.now();
-        const warm = await self.devWarmup();
-        if (!warm?.ok) return { stdout: "", stderr: `vite dev failed to warm up: ${warm?.error ?? "unknown"}\n`, exitCode: 1 };
+        const warm = await self.bootRealVite(root);
+        if (!warm?.ok) return { stdout: "", stderr: `vite dev failed to boot: ${warm?.error ?? "unknown"}\n${warm?.diag ? JSON.stringify(warm.diag).slice(0, 800) : ""}\n`, exitCode: 1 };
         return { stdout:
-          `vite dev server is LIVE (vite running from /tmp inside a workerd child isolate)\n` +
-          `  warmed in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${warm.deps} deps prebundled\n\n` +
-          `  ->  open in your browser:  ${url}\n\n` +
-          `  (HMR over WebSocket at ${url}__hmr; the server keeps serving while this REPL is open)\n`,
+          `vite dev server is LIVE — REAL vite bin running from ${root} in a workerd child isolate\n` +
+          `  booted in ${((Date.now() - t0) / 1000).toFixed(1)}s (config + plugins loaded from ${root}/vite.config; port ${warm.port})\n\n` +
+          `  ->  open in your browser:  ${url}\n`,
           stderr: "", exitCode: 0 };
       } catch (e) { return { stdout: "", stderr: `vite dev failed: ${e?.stack ?? e}\n`, exitCode: 1 }; }
     };
 
     // vite build | vite dev
-    const vite = defineCommand("vite", async (args) => {
-      if (args[0] === "dev" || args[0] === "serve") return runViteDev();
+    const vite = defineCommand("vite", async (args, ctx) => {
+      if (args[0] === "dev" || args[0] === "serve") return runViteDev(ctx?.cwd || PROJ);
       if (args[0] === "build" || !args[0]) {
         try {
           const fs = nodeFs;
@@ -671,11 +738,14 @@ export class Shell {
       }
     }
 
-    // Browser serve path: forward HTTP (and the /__hmr WebSocket upgrade) to the
-    // in-isolate vite dev child. Self-heal if this DO instance is cold.
+    // Browser serve path: forward HTTP (and the HMR WebSocket upgrade) to the REAL vite
+    // bin child for whichever project the user last `vite dev`'d (this.devRoot).
     if (this.env.DEV_PORT && url.pathname !== "/exec" && url.pathname !== "/init") {
-      if (!this.devReady) await this.ensureDevReady();
-      const child = this.env.LOADER.get("workerd-bash-vite-dev", () => viteDevChild(this.env.DEV_PORT));
+      if (!this.devRoot) {
+        return new Response("no vite dev server running yet — run `npm run dev` (or `vite dev`) in your project dir in the shell first.\n", { status: 503 });
+      }
+      const key = "vite-realbin:" + this.devRoot;
+      const child = this.env.LOADER.get(key, () => viteRealBinChild(this.env.DEV_PORT, this.devBin, this.devRoot));
       const ep = child.getEntrypoint();
       const fwd = new Request(new URL(url.pathname + url.search, "http://vite.local"), request);
       return await ep.fetch(fwd);
