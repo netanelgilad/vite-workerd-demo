@@ -190,6 +190,7 @@ function viteRealBinChild(devPort, bin, root) {
           }
           async warmup() { return (await this.#inst()).warmup(); }
           async fetch(request) { return (await this.#inst()).fetch(request); }
+          async notifyChange(file, event) { return (await this.#inst()).notifyChange(file, event); }
         }
       `,
     },
@@ -600,6 +601,23 @@ export class Shell {
     return binPath;
   }
 
+  // Report files written this command to the running vite dev server's watcher, so vite's
+  // real HMR pipeline runs (workerd has no OS file events; the shell owns every edit).
+  async flushChangesToVite() {
+    const out = { dirty: this._dirty ? [...this._dirty] : [], devRoot: this.devRoot || null, changed: [], results: [] };
+    if (!this.devRoot || !this._dirty || this._dirty.size === 0) { this._dirty?.clear(); return out; }
+    const changed = [...this._dirty].filter((p) => p.startsWith(this.devRoot + "/") && !p.includes("/node_modules/") && !p.endsWith("/.vite-realbin-probe.mjs"));
+    this._dirty.clear();
+    out.changed = changed;
+    if (!changed.length) return out;
+    try {
+      const child = this.env.LOADER.get("vite-realbin:" + this.devRoot, () => viteRealBinChild(this.env.DEV_PORT, this.devBin, this.devRoot));
+      const ep = child.getEntrypoint();
+      for (const f of changed) out.results.push(await ep.notifyChange(f, "change"));
+    } catch (e) { out.error = String(e); }
+    return out;
+  }
+
   // Boot the real-bin vite dev server for `root` and remember it for the browser path.
   async bootRealVite(root) {
     const bin = await this.setupRealVite(root);
@@ -617,7 +635,17 @@ export class Shell {
     const { Bash, defineCommand } = await import("just-bash");
     const { NativeFsAdapter } = await import("/tmp/bashshim/bash-native.mjs");
     nodeFs.mkdirSync(PROJ, { recursive: true });
-    const bash = new Bash({ fs: new NativeFsAdapter(), cwd: PROJ, defenseInDepth: false });
+    // Hook the fs adapter so every write is recorded; after each command we report changed
+    // files under the active dev root to vite's watcher (the file-watch primitive).
+    const fsAdapter = new NativeFsAdapter();
+    this._dirty = this._dirty || new Set();
+    for (const m of ["writeFile", "appendFile"]) {
+      const orig = fsAdapter[m].bind(fsAdapter);
+      fsAdapter[m] = async (p, ...a) => { const r = await orig(p, ...a); try { this._dirty.add(p); } catch {} return r; };
+    }
+    { const o = fsAdapter.cp.bind(fsAdapter); fsAdapter.cp = async (s, d, opt) => { const r = await o(s, d, opt); try { this._dirty.add(d); } catch {} return r; }; }
+    { const o = fsAdapter.mv.bind(fsAdapter); fsAdapter.mv = async (s, d) => { const r = await o(s, d); try { this._dirty.add(d); } catch {} return r; }; }
+    const bash = new Bash({ fs: fsAdapter, cwd: PROJ, defenseInDepth: false });
     const self = this;
 
     // npm install [pkgs...] | npm ls | npm run dev
@@ -732,8 +760,10 @@ export class Shell {
       const t0 = Date.now();
       try {
         const r = await bash.exec(body.cmd, { cwd: body.cwd || PROJ, ...(body.opts || {}) });
-        return Response.json({ ok: true, ms: Date.now() - t0, exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr });
+        const hmr = await this.flushChangesToVite();
+        return Response.json({ ok: true, ms: Date.now() - t0, exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, hmr });
       } catch (e) {
+        try { await this.flushChangesToVite(); } catch {}
         return Response.json({ ok: false, error: String(e?.stack ?? e) }, { status: 500 });
       }
     }

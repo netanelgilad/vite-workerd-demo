@@ -123,8 +123,13 @@ async function startRealVite(root, devPort) {
       root,
       mode: "development",
       logLevel: "info",
-      server: { host: "127.0.0.1", port: Number(devPort) || 5173, strictPort: false },
+      // watch:null -> vite uses a NoopWatcher (a real EventEmitter wired to the HMR
+      // pipeline) instead of chokidar. workerd has no fs.watch/fs.watchFile, so we drive
+      // file-change events ourselves via server.watcher.emit('change', file) (notifyChange,
+      // called by the shell on every write). This IS the watch primitive for this env.
+      server: { host: "127.0.0.1", port: Number(devPort) || 5173, strictPort: false, watch: null },
     });
+    globalThis.__VITE_SERVER = server;
     await server.listen();
     diagLog("server.listen() resolved");
   } catch (e) {
@@ -257,12 +262,29 @@ function drainServerFrames(buf, onText, onPing, onClose) {
   return off;
 }
 
-function makeWsBridge(serverWs) {
+// A tiny async queue: pull() resolves when push() has an item.
+function makeQueue() {
+  const items = [];
+  let resolve = null;
+  return {
+    push(x) { if (resolve) { const r = resolve; resolve = null; r(x); } else items.push(x); },
+    pull() { return items.length ? Promise.resolve(items.shift()) : new Promise((r) => { resolve = r; }); },
+  };
+}
+
+const WS_CLOSE = Symbol("ws-close");
+
+// Bridge vite's `ws` (a Duplex it frames over) to a workerd WebSocketPair. Outbound frames
+// (vite -> browser) are decoded and pushed to `outbound` (a queue) — NOT sent on serverWs
+// here, because vite's broadcast runs in a different invocation context (notifyChange) than
+// the one that accepted the socket; workerd only allows sending from the accepting context.
+// The upgrade handler drains the queue and sends, in its own (waitUntil-kept-alive) context.
+function makeWsBridge(serverWs, outbound) {
   const sock = new EventEmitter();
   sock.readable = true; sock.writable = true;
   for (const m of ["setNoDelay", "setTimeout", "setKeepAlive", "pause", "resume", "cork", "uncork", "ref", "unref"]) sock[m] = () => sock;
   sock.unshift = () => {};
-  sock.destroy = () => { try { serverWs.close(); } catch {} sock.emit("close"); };
+  sock.destroy = () => { try { outbound(WS_CLOSE); } catch {} sock.emit("close"); };
   sock.end = () => sock.destroy();
   let handshakeDone = false;
   let acc = Buffer.alloc(0);
@@ -279,20 +301,21 @@ function makeWsBridge(serverWs) {
     if (buf.length) {
       acc = Buffer.concat([acc, buf]);
       const consumed = drainServerFrames(acc,
-        (text) => { try { serverWs.send(text); } catch {} },
+        (text) => { try { outbound(text); } catch {} },
         () => { try { sock.emit("data", wsFrame("", 0xA)); } catch {} },
-        () => { try { serverWs.close(); } catch {} });
+        () => { try { outbound(WS_CLOSE); } catch {} });
       acc = acc.slice(consumed);
     }
     if (typeof enc === "function") enc(); else if (typeof cb === "function") cb();
     return true;
   };
+  // browser -> vite (these events fire in the accepting context, which we keep alive)
   serverWs.addEventListener("message", (ev) => {
     const data = typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
     try { sock.emit("data", wsFrame(data, 0x1)); } catch {}
   });
-  serverWs.addEventListener("close", () => sock.emit("close"));
-  serverWs.addEventListener("error", () => sock.emit("close"));
+  serverWs.addEventListener("close", () => { try { outbound(WS_CLOSE); } catch {} sock.emit("close"); });
+  serverWs.addEventListener("error", () => { try { outbound(WS_CLOSE); } catch {} sock.emit("close"); });
   return sock;
 }
 
@@ -317,6 +340,26 @@ export default class extends WorkerEntrypoint {
     return out;
   }
 
+  // The watch primitive: the shell calls this after each write so vite's real HMR pipeline
+  // runs (server.watcher 'change' -> moduleGraph -> ws update). workerd has no OS file
+  // events; the shell owns every edit, so it reports them precisely.
+  async notifyChange(file, event = "change") {
+    const s = globalThis.__VITE_SERVER;
+    if (!s || !s.watcher || typeof s.watcher.emit !== "function") return { ok: false, error: "no server/watcher" };
+    const before = DIAG.logs.length;
+    let mods;
+    try {
+      const env = s.environments?.client;
+      const m = env?.moduleGraph?.getModulesByFile?.(file);
+      mods = m ? (m.size ?? m.length ?? [...m].length) : 0;
+    } catch (e) { mods = "err:" + String(e); }
+    try { s.watcher.emit(event, file); } catch (e) { return { ok: false, error: String(e) }; }
+    await new Promise((r) => setTimeout(r, 400)); // let async onFileChange run + send
+    let clients;
+    try { clients = s.environments?.client?.hot?.clients?.size ?? s.ws?.clients?.size ?? null; } catch { clients = "err"; }
+    return { ok: true, modsForFile: mods, bundledDev: s.config?.experimental?.bundledDev ?? null, clients, wsOut: (globalThis.__WS_OUT || []).slice(-6), logs: DIAG.logs.slice(before).slice(-6) };
+  }
+
   async fetch(request) {
     this.env.__ctx = this.ctx;
     globalThis.__VITE_BIN = this.env.VITE_BIN;
@@ -334,7 +377,18 @@ export default class extends WorkerEntrypoint {
           headers: Object.fromEntries([...request.headers].map(([k, v]) => [k.toLowerCase(), v])),
         };
         req.headers.host = "localhost";
-        server.emit("upgrade", req, makeWsBridge(srv), Buffer.alloc(0));
+        // vite broadcasts updates from a LATER invocation (notifyChange); workerd only lets
+        // us send on srv from THIS (accepting) context. So queue vite's outbound frames and
+        // drain them here, kept alive via waitUntil for the life of the connection.
+        const queue = makeQueue();
+        server.emit("upgrade", req, makeWsBridge(srv, (m) => queue.push(m)), Buffer.alloc(0));
+        this.ctx.waitUntil((async () => {
+          for (;;) {
+            const m = await queue.pull();
+            if (m === WS_CLOSE) break;
+            try { srv.send(m); } catch { break; }
+          }
+        })());
         const offered = request.headers.get("Sec-WebSocket-Protocol");
         const headers = {};
         if (offered) headers["Sec-WebSocket-Protocol"] = offered.split(",")[0].trim();
