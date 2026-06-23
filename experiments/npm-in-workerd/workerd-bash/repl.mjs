@@ -85,8 +85,10 @@ const HELP = `workerd-bash — a shell INTO a workerd v8 isolate over its shared
 
   typical flow:  npm install  ->  vite dev  ->  open the printed URL in your browser`;
 
-const isTTY = process.stdin.isTTY;
-const rl = readline.createInterface({ input: process.stdin, terminal: isTTY });
+const isTTY = !!process.stdin.isTTY;
+// `output` is REQUIRED for readline to echo your keystrokes in terminal mode — without it
+// typing is invisible. Pass it explicitly.
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: isTTY });
 
 console.log(`# workerd-bash — fork binary: ${workerd}`);
 console.log(`# you are inside a workerd Durable Object's native /tmp. Type 'help'. Dev server port: ${PORT}.`);
@@ -106,18 +108,48 @@ async function handle(cmd) {
   if (r.error) console.error("[ERROR] " + r.error.split("\n").slice(0, 12).join("\n"));
 }
 
-const prompt = () => { if (isTTY) process.stdout.write(`workerd:${cwd}$ `); };
-prompt();
-for await (const line of rl) {
-  const cmd = line.trim();
-  if (!cmd) { prompt(); continue; }
-  if (cmd === "exit" || cmd === "quit") break;
-  if (!isTTY) console.log(`workerd:${cwd}$ ${cmd}`);
-  try { await handle(cmd); } catch (e) { console.error("[host error] " + e); }
-  prompt();
+const setPrompt = () => rl.setPrompt(`workerd:${cwd}$ `);
+
+// Event-based loop (more robust than `for await`, which pauses input between lines and can
+// swallow echo). readline echoes input itself in terminal mode. Commands are SERIALIZED via
+// a queue so that fast input / a piped script runs one-at-a-time and in order (otherwise
+// async handlers race and `exit` can dispose mid-command).
+const queue = [];
+let draining = false;
+let inputEnded = false;
+let shuttingDown = false;
+
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("\n# bye — fallback stats: " + JSON.stringify(stats()));
+  // dispose can hang on a shared-tmp child; cap it then hard-exit.
+  await Promise.race([mf.dispose(), new Promise((r) => setTimeout(r, 3000))]);
+  process.exit(0);
 }
 
-console.log("\n# bye — fallback stats: " + JSON.stringify(stats()));
-// dispose can hang on a shared-tmp child; cap it then hard-exit.
-await Promise.race([mf.dispose(), new Promise((r) => setTimeout(r, 3000))]);
-process.exit(0);
+async function drain() {
+  if (draining) return;
+  draining = true;
+  while (queue.length) {
+    const cmd = queue.shift();
+    if (cmd === "exit" || cmd === "quit") { inputEnded = true; break; }
+    if (!isTTY) console.log(`workerd:${cwd}$ ${cmd}`);
+    try { await handle(cmd); } catch (e) { console.error("[host error] " + e); }
+    setPrompt();
+    rl.prompt();
+  }
+  draining = false;
+  if (inputEnded) await shutdown(); // dispose only AFTER the queue is drained
+}
+
+setPrompt();
+rl.prompt();
+rl.on("line", (line) => {
+  const cmd = line.trim();
+  if (!cmd) { if (!draining) rl.prompt(); return; }
+  queue.push(cmd);
+  drain();
+});
+// EOF (Ctrl-D) or end of a piped script: finish queued commands, then shut down.
+rl.on("close", () => { inputEnded = true; drain(); });
