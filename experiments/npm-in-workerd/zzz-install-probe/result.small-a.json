@@ -1,0 +1,33 @@
+{
+  "runId": "small-a",
+  "small": true,
+  "startedAt": "2026-06-21T13:34:40.195Z",
+  "result": "completed",
+  "status": 200,
+  "wall": 2302,
+  "ok": true,
+  "ms": 2088,
+  "instr": {
+    "phases": {},
+    "http": {
+      "reqStart": 2,
+      "reqDone": 2,
+      "reqErr": 0,
+      "inflightMax": 1,
+      "ended": 2,
+      "byEvent": {
+        "res-close": 4
+      }
+    },
+    "events": [
+      "[+14ms] package.json written (small=true, deps=1)",
+      "[+728ms] Arborist imported",
+      "[+728ms] reify START",
+      "[+745ms] SAMPLE inflight=1 reqStart=1 reqDone=0 ended=0 err=0 maxInflight=1 byEvent={} live=#1:req-sent:6ms:registry.npmjs.org/lodash",
+      "[+1748ms] SAMPLE inflight=1 reqStart=2 reqDone=2 ended=1 err=0 maxInflight=1 byEvent={\"res-close\":2} live=#2:body-reading(200):295ms:registry.npmjs.org/lodash/-/lodash-4.18.",
+      "[+2086ms] reify DONE"
+    ]
+  },
+  "installedCount": 1,
+  "instrLogTail": "[+14ms] package.json written (small=true, deps=1)\n[+728ms] Arborist imported\n[+728ms] reify START\n[+745ms] SAMPLE inflight=1 reqStart=1 reqDone=0 ended=0 err=0 maxInflight=1 byEvent={} live=#1:req-sent:6ms:registry.npmjs.org/lodash\n[+1748ms] SAMPLE inflight=1 reqStart=2 reqDone=2 ended=1 err=0 maxInflight=1 byEvent={\"res-close\":2} live=#2:body-reading(200):295ms:registry.npmjs.org/lodash/-/lodash-4.18.\n[+2086ms] reify DONE\n"
+}

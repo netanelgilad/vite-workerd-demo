@@ -1,0 +1,31 @@
+{
+  "runId": "small-x3",
+  "small": true,
+  "startedAt": "2026-06-21T13:28:36.988Z",
+  "result": "completed",
+  "status": 200,
+  "wall": 1693,
+  "ok": true,
+  "ms": 1640,
+  "instr": {
+    "phases": {},
+    "http": {
+      "reqStart": 2,
+      "reqDone": 2,
+      "reqErr": 0,
+      "inflightMax": 1,
+      "ended": 2,
+      "byEvent": {
+        "res-close": 4
+      }
+    },
+    "events": [
+      "[+10ms] package.json written (small=true, deps=1)",
+      "[+367ms] Arborist imported",
+      "[+367ms] reify START",
+      "[+1640ms] reify DONE"
+    ]
+  },
+  "installedCount": 1,
+  "instrLogTail": "[+10ms] package.json written (small=true, deps=1)\n[+367ms] Arborist imported\n[+367ms] reify START\n[+1640ms] reify DONE\n"
+}

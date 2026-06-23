@@ -1,0 +1,8 @@
+{
+  "runId": "crashfull",
+  "small": false,
+  "startedAt": "2026-06-21T13:30:35.424Z",
+  "result": "harness-error",
+  "wall": 30637,
+  "error": "Error: status poll lost worker (20x): fetch failed\n    at file:///Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/zzz-install-probe/probe.mjs:83:67\n    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)"
+}

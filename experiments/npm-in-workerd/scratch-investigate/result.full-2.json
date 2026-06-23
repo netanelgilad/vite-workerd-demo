@@ -1,0 +1,8 @@
+{
+  "runId": "full-2",
+  "small": false,
+  "startedAt": "2026-06-21T12:59:27.876Z",
+  "result": "harness-error",
+  "wall": 5491,
+  "error": "TypeError: fetch failed\n    at Object.processResponse (/Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/node_modules/undici/lib/web/fetch/index.js:237:16)\n    at /Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/node_modules/undici/lib/web/fetch/index.js:1081:19\n    at node:internal/process/task_queues:151:7\n    at AsyncResource.runInAsyncScope (node:async_hooks:214:14)\n    at AsyncResource.runMicrotask (node:internal/process/task_queues:148:8)\n    at /Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/node_modules/undici/index.js:157:7\n    at async fetch5 (/Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/node_modules/miniflare/dist/src/index.js:60823:20)\n    at async _Miniflare.dispatchFetch (/Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/node_modules/miniflare/dist/src/index.js:91927:22)\n    at async file:///Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/scratch-investigate/install-only.mjs:59:15"
+}

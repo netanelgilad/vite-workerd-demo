@@ -1,0 +1,8 @@
+{
+  "runId": "vdbg",
+  "small": false,
+  "startedAt": "2026-06-21T13:31:15.152Z",
+  "result": "harness-error",
+  "wall": 53588,
+  "error": "Error: status poll lost worker (20x): fetch failed\n    at file:///Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/zzz-install-probe/probe.mjs:83:67\n    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)"
+}

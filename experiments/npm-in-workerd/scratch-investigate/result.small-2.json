@@ -1,0 +1,33 @@
+{
+  "runId": "small-2",
+  "small": true,
+  "startedAt": "2026-06-21T13:03:17.551Z",
+  "result": "completed",
+  "status": 200,
+  "wall": 2441,
+  "ok": true,
+  "ms": 2351,
+  "instr": {
+    "phases": {},
+    "http": {
+      "reqStart": 2,
+      "reqDone": 2,
+      "reqErr": 0,
+      "inflightMax": 1,
+      "ended": 2,
+      "byEvent": {
+        "res-close": 4
+      }
+    },
+    "events": [
+      "[+0ms] SEMAPHORE enabled MAXCONC=4",
+      "[+12ms] package.json written (small=true, deps=1)",
+      "[+727ms] Arborist imported",
+      "[+727ms] reify START",
+      "[+2014ms] SAMPLE inflight=1 reqStart=2 reqDone=2 ended=1 err=0 maxInflight=1 byEvent={\"res-close\":2}",
+      "[+2351ms] reify DONE"
+    ]
+  },
+  "installedCount": 1,
+  "instrLogTail": "[+0ms] SEMAPHORE enabled MAXCONC=4\n[+12ms] package.json written (small=true, deps=1)\n[+727ms] Arborist imported\n[+727ms] reify START\n[+2014ms] SAMPLE inflight=1 reqStart=2 reqDone=2 ended=1 err=0 maxInflight=1 byEvent={\"res-close\":2}\n[+2351ms] reify DONE\n"
+}

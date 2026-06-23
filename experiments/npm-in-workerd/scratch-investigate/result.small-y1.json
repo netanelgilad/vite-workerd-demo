@@ -1,0 +1,31 @@
+{
+  "runId": "small-y1",
+  "small": true,
+  "startedAt": "2026-06-21T13:29:43.762Z",
+  "result": "completed",
+  "status": 200,
+  "wall": 1840,
+  "ok": true,
+  "ms": 1676,
+  "instr": {
+    "phases": {},
+    "http": {
+      "reqStart": 2,
+      "reqDone": 2,
+      "reqErr": 0,
+      "inflightMax": 1,
+      "ended": 2,
+      "byEvent": {
+        "res-close": 4
+      }
+    },
+    "events": [
+      "[+13ms] package.json written (small=true, deps=1)",
+      "[+388ms] Arborist imported",
+      "[+389ms] reify START",
+      "[+1676ms] reify DONE"
+    ]
+  },
+  "installedCount": 1,
+  "instrLogTail": "[+13ms] package.json written (small=true, deps=1)\n[+388ms] Arborist imported\n[+389ms] reify START\n[+1676ms] reify DONE\n"
+}

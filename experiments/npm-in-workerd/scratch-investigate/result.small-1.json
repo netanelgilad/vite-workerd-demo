@@ -1,0 +1,32 @@
+{
+  "runId": "small-1",
+  "small": true,
+  "startedAt": "2026-06-21T12:59:13.928Z",
+  "result": "completed",
+  "status": 200,
+  "wall": 2317,
+  "ok": true,
+  "ms": 2233,
+  "instr": {
+    "phases": {},
+    "http": {
+      "reqStart": 2,
+      "reqDone": 2,
+      "reqErr": 0,
+      "inflightMax": 1,
+      "ended": 2,
+      "byEvent": {
+        "res-close": 4
+      }
+    },
+    "events": [
+      "[+12ms] package.json written (small=true, deps=1)",
+      "[+680ms] Arborist imported",
+      "[+681ms] reify START",
+      "[+2012ms] SAMPLE inflight=1 reqStart=2 reqDone=2 ended=1 err=0 maxInflight=1 byEvent={\"res-close\":2}",
+      "[+2232ms] reify DONE"
+    ]
+  },
+  "installedCount": 1,
+  "instrLogTail": "[+12ms] package.json written (small=true, deps=1)\n[+680ms] Arborist imported\n[+681ms] reify START\n[+2012ms] SAMPLE inflight=1 reqStart=2 reqDone=2 ended=1 err=0 maxInflight=1 byEvent={\"res-close\":2}\n[+2232ms] reify DONE\n"
+}

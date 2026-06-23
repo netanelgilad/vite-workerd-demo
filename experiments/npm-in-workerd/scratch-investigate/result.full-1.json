@@ -1,0 +1,8 @@
+{
+  "runId": "full-1",
+  "small": false,
+  "startedAt": "2026-06-21T12:47:30.401Z",
+  "result": "harness-error",
+  "wall": 600963,
+  "error": "Error: TIMEOUT 600000ms: install\n    at Timeout._onTimeout (file:///Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd/scratch-investigate/install-only.mjs:40:72)\n    at listOnTimeout (node:internal/timers:588:17)\n    at process.processTimers (node:internal/timers:523:7)"
+}
