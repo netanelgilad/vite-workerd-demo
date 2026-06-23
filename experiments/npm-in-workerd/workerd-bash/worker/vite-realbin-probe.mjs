@@ -108,11 +108,14 @@ async function startRealVite(root, devPort) {
   try { np.default.stderr.write = (s) => { diagLog("[err] " + (typeof s === "string" ? s : String(s)).trimEnd()); return true; }; } catch {}
   globalThis.addEventListener?.("unhandledrejection", (ev) => { try { DIAG.errors.push("unhandledrejection(evt): " + String(ev.reason && ev.reason.stack || ev.reason)); } catch {} });
 
-  // DIAGNOSTIC PATH: the cac bin runs createServer in a fire-and-forget action whose
-  // errors workerd swallows. Call vite's OWN createServer directly (awaited) so we see the
-  // real failure. Config is discovered (no configFile:false / manual plugins) — honoring
-  // the project's real vite.config. Once this is green we route through the bin again.
-  diagLog("import vite createServer");
+  // Run vite's OWN server bootstrap (awaited). This is exactly what the `vite` bin's serve
+  // action does — `const server = await createServer(...); await server.listen()` — minus
+  // the cac CLI wrapper, which can't run here: cac invokes the action fire-and-forget and
+  // workerd swallows the resulting rejection, so the bin boots silently to nothing. Calling
+  // createServer directly runs vite's real code with full config discovery (the project's
+  // own vite.config + plugins + dep optimizer) and surfaces errors. Config is discovered
+  // (no configFile:false, no manual plugins) — the project's real config is honored.
+  diagLog("vite.createServer (real config discovery) from " + root);
   try {
     const vite = await import(root + "/node_modules/vite/dist/node/index.js").catch(() => import("vite"));
     diagLog("vite module imported; version=" + (vite.version || "?"));
@@ -122,7 +125,6 @@ async function startRealVite(root, devPort) {
       logLevel: "info",
       server: { host: "127.0.0.1", port: Number(devPort) || 5173, strictPort: false },
     });
-    diagLog("createServer resolved; calling listen()");
     await server.listen();
     diagLog("server.listen() resolved");
   } catch (e) {
