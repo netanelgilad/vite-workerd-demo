@@ -63,7 +63,7 @@ sed -i 's#"vite": "[^"]*"#"vite": "npm:@netanelgilad/vite@8.0.16-workerd.0", "ro
 cd myapp
 npm install
 npm run dev                                            # open http://127.0.0.1:5190/
-sed -i 's/Vite + React/Vite in workerd/' src/App.tsx   # → updates LIVE in the browser (HMR)
+sed -i 's/Get started/Hello from workerd/' src/App.tsx   # edit the <h1> → updates LIVE in the browser (HMR)
 ```
 
 `npm create`/`exec`/`npx` run the real bins through a `child_process.spawn` →

@@ -288,7 +288,7 @@ sed -i 's#"vite": "[^"]*"#"vite": "npm:@netanelgilad/vite@8.0.16-workerd.0", "ro
 cd myapp
 npm install                                            # the app's own deps, from public npm
 npm run dev                                            # the REAL vite bin serving myapp → open http://127.0.0.1:5190/
-sed -i 's/Vite + React/Vite in workerd/' src/App.tsx   # edit a component → it updates LIVE in the browser
+sed -i 's/Get started/Hello from workerd/' src/App.tsx   # edit the <h1> → it updates LIVE in the browser
 ```
 
 Three primitives make this work — each *fixing a missing capability*, not
