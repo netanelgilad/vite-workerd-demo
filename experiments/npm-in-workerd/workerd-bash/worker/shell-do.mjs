@@ -341,35 +341,52 @@ export class Shell {
   // Faithful to `npm install <pkgs>`: Arborist resolves+fetches from
   // https://registry.npmjs.org/ over workerd native fs (the tar sync-extract
   // workaround in the module-fallback host makes this work).
-  async npmInstall(extraDeps, root = PROJ) {
+  // Run the REAL npm CLI install command — npm's own documented programmatic entry
+  // (`new Npm() -> load() -> exec('install', args)`), NOT a hand-rolled Arborist call and
+  // with NO fabricated deps. npm decides what to do from the real package.json in `root`
+  // (none -> npm installs nothing, exactly like the real CLI). Flags are real npm flags a
+  // user would pass here: --ignore-scripts (workerd has no spawn for lifecycle scripts),
+  // --legacy-peer-deps (the fork prerelease peer case), --cache/--registry, and isolated
+  // user/global config so it doesn't read the host's ~/.npmrc.
+  async npmInstall(specs, root = PROJ) {
     await patchProcessReport();
     const fs = nodeFs;
     fs.mkdirSync(root, { recursive: true });
     fs.mkdirSync(CACHE, { recursive: true });
-    let pkg = { name: "scratch", version: "1.0.0", private: true, type: "module", dependencies: {} };
-    try { pkg = JSON.parse(fs.readFileSync(root + "/package.json", "utf8")); pkg.dependencies ??= {}; } catch {}
-    // Real `npm install` reifies the project's own package.json. We only inject the demo
-    // default set (fork vite + ToDo deps) when this is a BARE project with no deps of its
-    // own AND nothing was explicitly requested — otherwise we honor what's declared.
-    const declared = Object.keys(pkg.dependencies || {}).length + Object.keys(pkg.devDependencies || {}).length;
-    const explicit = extraDeps && Object.keys(extraDeps).length;
-    let deps = {};
-    if (explicit) { deps = extraDeps; Object.assign(pkg.dependencies, deps); fs.writeFileSync(root + "/package.json", JSON.stringify(pkg, null, 2)); }
-    else if (declared === 0) { deps = DEFAULT_DEPS; Object.assign(pkg.dependencies, deps); fs.writeFileSync(root + "/package.json", JSON.stringify(pkg, null, 2)); }
+    const argv = [
+      "node", "/tmp/xnm/npm/bin/npm-cli.js", "install", ...(specs || []),
+      "--ignore-scripts", "--no-audit", "--no-fund", "--no-update-notifier",
+      "--legacy-peer-deps", "--cache=" + CACHE, "--registry=https://registry.npmjs.org/",
+      "--userconfig=/tmp/.npmrc-user-none", "--globalconfig=/tmp/.npmrc-global-none",
+    ];
+    const np = await import("node:process");
+    const procs = [...new Set([np.default, np, globalThis.process].filter(Boolean))];
+    const savedArgv = np.default.argv;
+    const savedCwd = np.default.cwd;
+    const sout = np.default.stdout?.write?.bind(np.default.stdout);
+    const serr = np.default.stderr?.write?.bind(np.default.stderr);
+    const out = [];
     const t0 = Date.now();
-    const { default: Arborist } = await import(ARBORIST);
-    const arb = new Arborist({
-      path: root, cache: CACHE, registry: "https://registry.npmjs.org/",
-      ignoreScripts: true, audit: false, fund: false, progress: false,
-      packumentCache: new Map(),
-      // The fork's 8.0.16-workerd.0 is a prerelease that strict semver rejects against
-      // plugin peers — the canonical --legacy-peer-deps case a real user would also pass.
-      legacyPeerDeps: true,
-    });
-    await arb.reify({ ignoreScripts: true, audit: false, legacyPeerDeps: true });
+    let error = null;
+    try {
+      for (const p of procs) { try { p.argv = argv.slice(); } catch {} try { p.cwd = () => root; } catch { try { Object.defineProperty(p, "cwd", { configurable: true, value: () => root }); } catch {} } }
+      try { np.default.stdout.write = (s) => { out.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
+      try { np.default.stderr.write = (s) => { out.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
+      const NpmMod = await import("/tmp/xnm/npm/lib/npm.js");
+      const Npm = NpmMod.default || NpmMod;
+      const npm = new Npm();
+      const { command, args } = await npm.load();
+      if (command) await npm.exec(command, args);
+    } catch (e) {
+      error = String(e && e.stack || e);
+    } finally {
+      for (const p of procs) { try { p.argv = savedArgv; } catch {} try { p.cwd = savedCwd; } catch {} }
+      try { np.default.stdout.write = sout; } catch {}
+      try { np.default.stderr.write = serr; } catch {}
+    }
     let installed = [];
     try { installed = fs.readdirSync(root + "/node_modules").filter((n) => !n.startsWith(".")); } catch {}
-    return { ms: Date.now() - t0, installed, deps: Object.keys(deps), root };
+    return { ms: Date.now() - t0, installed, root, log: out.join(""), error };
   }
 
   // Install the child_process -> isolate-spawn bridge. The host rewrites npm's
@@ -490,12 +507,19 @@ export class Shell {
     const manifest = await res.json();
     let files = 0;
     for (const [rel, b64] of Object.entries(manifest)) {
-      if (rel === "package.json") continue; // keep our install package.json
+      if (rel === "package.json") continue; // we write a fork-pinned one below
       const p = PROJ + "/" + rel;
       fs.mkdirSync(p.slice(0, p.lastIndexOf("/")), { recursive: true });
       fs.writeFileSync(p, Buffer.from(b64, "base64"));
       files++;
     }
+    // Write the ToDo app's package.json pinned to the workerd forks, so the REAL
+    // `npm install` reifies workerd-ready deps (app-todo's own package.json pins stock
+    // vite, which can't run here — same repin a create-vite user does by hand).
+    fs.writeFileSync(PROJ + "/package.json", JSON.stringify({
+      name: "todo-app", version: "0.0.0", private: true, type: "module", dependencies: { ...DEFAULT_DEPS },
+    }, null, 2));
+    files++;
     // rolldown's wasm resolver treats a root-relative html src as fs-absolute.
     try {
       let html = fs.readFileSync(PROJ + "/index.html", "utf8");
@@ -653,17 +677,16 @@ export class Shell {
       const sub = args[0];
       const cwd = ctx?.cwd || PROJ;
       if (sub === "install" || sub === "i" || sub === "add") {
-        const specs = args.slice(1).filter((a) => !a.startsWith("-"));
-        let extra = null;
-        if (specs.length) { extra = {}; for (const s of specs) { const name = s.replace(/@[^@]*$/, "") || s; extra[name] = s.slice(name.length + 1) || "*"; } }
-        try {
-          const banner = `npm install${specs.length ? " " + specs.join(" ") : ""}  (Arborist -> ${cwd}/node_modules, public registry; can take a few minutes)\n`;
-          const r = await self.npmInstall(extra, cwd);
-          return { stdout: banner + `+ installed ${r.installed.length} packages in ${(r.ms / 1000).toFixed(1)}s\n` +
-            `node_modules: ${r.installed.join(", ")}\n`, stderr: "", exitCode: 0 };
-        } catch (e) {
-          return { stdout: "", stderr: `npm install failed: ${e?.stack ?? e}\n`, exitCode: 1 };
+        const specs = args.slice(1).filter((a) => !a.startsWith("-")); // real npm install args
+        const r = await self.npmInstall(specs, cwd);
+        // Surface the REAL npm output. If npm errored, report it (don't pretend success).
+        const tail = (r.log || "").trim();
+        if (r.error) {
+          return { stdout: tail ? tail + "\n" : "", stderr: `npm install failed: ${r.error.split("\n").slice(0, 12).join("\n")}\n`, exitCode: 1 };
         }
+        return { stdout: (tail ? tail + "\n" : "") +
+          `(npm reified ${cwd}/package.json -> ${r.installed.length} packages in node_modules, ${(r.ms / 1000).toFixed(1)}s)\n`,
+          stderr: "", exitCode: 0 };
       }
       if (sub === "ls") {
         try {

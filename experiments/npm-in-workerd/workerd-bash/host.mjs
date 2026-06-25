@@ -144,14 +144,22 @@ function rewriteSource(src, virtPath, format) {
   // route node:process / process to the shim (require('node:process') segfaults workerd)
   const importSite = (spec) =>
     new RegExp(String.raw`(\bfrom\s*|\bimport\s*\(\s*|\b__require\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)(["'])${spec.replace(/[/\\]/g, "\\$&")}\2`, "gm");
-  for (const [spec, target] of [
-    ["node:process", "/tmp/shims/process.cjs"], ["process", "/tmp/shims/process.cjs"],
-    // workerd resolves node builtins internally (never via the fallback) and its native
-    // child_process.spawn throws; rewrite the specifier to a shim that maps spawn() onto
-    // an isolate-spawn over /tmp (globalThis.__ISOLATE_SPAWN). Lets real `npm create/exec` run.
-    ["node:child_process", "/tmp/shims/child_process.cjs"], ["child_process", "/tmp/shims/child_process.cjs"],
-  ]) {
-    src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
+  // Don't rewrite specifiers inside our own shims (they intentionally require the real
+  // builtins — rewriting would create a self-referential loop).
+  if (!virtPath.startsWith("/tmp/shims/")) {
+    for (const [spec, target] of [
+      ["node:process", "/tmp/shims/process.cjs"], ["process", "/tmp/shims/process.cjs"],
+      // workerd resolves node builtins internally (never via the fallback) and its native
+      // child_process.spawn throws; rewrite the specifier to a shim that maps spawn() onto
+      // an isolate-spawn over /tmp (globalThis.__ISOLATE_SPAWN). Lets real `npm create/exec` run.
+      ["node:child_process", "/tmp/shims/child_process.cjs"], ["child_process", "/tmp/shims/child_process.cjs"],
+      // workerd's v8.getHeapStatistics().heap_size_limit is 0, so Arborist's PackumentCache
+      // builds an lru-cache with maxSize:0 and throws. Shim supplies a sane heap limit so the
+      // REAL npm install runs.
+      ["node:v8", "/tmp/shims/v8.cjs"], ["v8", "/tmp/shims/v8.cjs"],
+    ]) {
+      src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
+    }
   }
   return src;
 }

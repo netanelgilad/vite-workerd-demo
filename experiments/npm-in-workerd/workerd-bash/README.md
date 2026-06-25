@@ -36,9 +36,9 @@ workerd:/tmp/proj$ pwd                   # /tmp/proj
 workerd:/tmp/proj$ echo hi > note.txt    # just-bash builtins over the isolate's
 workerd:/tmp/proj$ cat note.txt          #   real native /tmp: ls cat echo mkdir
 workerd:/tmp/proj$ ls sub | wc -l        #   rm cd, pipes, > and >> redirects
-workerd:/tmp/proj$ npm install           # @netanelgilad/vite + ToDo deps from
-                                         #   public npm (no args = the default set);
-                                         #   `npm install left-pad react ...` for specifics
+workerd:/tmp/proj$ npm install           # the REAL npm CLI (npm.load()+exec('install'));
+                                         #   reifies the cwd's package.json from public npm.
+                                         #   `npm install left-pad react ...` adds packages.
 workerd:/tmp/proj$ npm ls                # list installed packages
 workerd:/tmp/proj$ npm create vite myapp -- --template react-ts   # REAL create-vite in a sub-isolate
 workerd:/tmp/proj$ npm exec <pkg> / npx <pkg>   # real libnpmexec via the child_process->isolate bridge
@@ -51,8 +51,9 @@ workerd:/tmp/proj$ exit
 
 Two flows:
 
-**Quick (prebaked ToDo):** `npm install` → `vite dev` → open the printed
-`http://127.0.0.1:5190/` → the ToDo app, served by Vite running from `/tmp`.
+**Quick (prebaked ToDo):** `scaffold` → `npm install` → `vite dev` → open the printed
+`http://127.0.0.1:5190/` → the ToDo app, served by Vite running from `/tmp`. (`scaffold`
+writes the app **and** a fork-pinned `package.json`, which the real `npm install` reifies.)
 
 **Full (real `npm create` → live HMR):** scaffold a brand-new app and edit it live:
 
