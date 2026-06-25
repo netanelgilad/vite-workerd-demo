@@ -14,3 +14,11 @@ experiments/npm-in-workerd/do-shell/worker/rolldown.wasm
 # published fork tarballs live on npm now — never commit the big tgz blobs
 packages/**/*.tgz
 *.tgz
+
+# packages/{rolldown,vite} are regenerable `npm pack` output (the packages live
+# on npm); only packages/PUBLISH.md is tracked. Recover with `npm pack @netanelgilad/<pkg>`.
+packages/rolldown/
+packages/vite/
+
+# prep-install-url uses a node_modules symlink into the npm-in-workerd experiment
+prep-install-url/node_modules
