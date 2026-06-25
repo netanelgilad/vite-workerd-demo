@@ -104,6 +104,7 @@ Concretely demonstrated, with the checks/artifacts that back each claim:
 | Rolldown bundles single-threaded | forked wasm with `asyncWorkPoolSize: 0` and a hard guard that **throws** on any worker-thread spawn — 0 threads, by construction |
 | real `npm install` runs inside workerd | `@npmcli/arborist` `reify()` fetches from `registry.npmjs.org` into the isolate FS (Layer 2) |
 | the full loop in a Durable Object | `npm install @netanelgilad/vite` from public npm → `vite build`/`dev` from `/tmp` in a sub-isolate → ToDo app driven in a real browser; captured in [`do-machine-clean/proof/`](experiments/npm-in-workerd/do-machine-clean/proof/) (Layer 3, fork) |
+| real `npm create vite` → live HMR, in the shell | `npm create vite` (real `libnpmexec` + `create-vite` via the `child_process`→isolate bridge) → `npm install` → real `vite` bin `dev` for the cwd → editing a component pushes a live HMR `update` to the browser; asserted in [`workerd-bash/test-realbin-dev.mjs`](experiments/npm-in-workerd/workerd-bash/test-realbin-dev.mjs) (Layer 3, fork) |
 
 Everything labeled "inside workerd" genuinely executes in the isolate — there is
 no path that silently shells out to host Node for the build. The host process's
@@ -268,13 +269,43 @@ supplies `import.meta.url` natively. The captured proof (resolved
 public-registry dependency tree, real `dist/`, and live-browser DOM assertions)
 is in [`do-machine-clean/proof/`](experiments/npm-in-workerd/do-machine-clean/proof/).
 
-[`workerd-bash/`](experiments/npm-in-workerd/workerd-bash/) wires the same
-operations behind an interactive shell — you type `npm install` → `vite dev`
-inside a running isolate and open the printed URL:
+### The full hands-on flow: real `npm create vite` → live HMR
+
+[`workerd-bash/`](experiments/npm-in-workerd/workerd-bash/) is an interactive
+shell into a running DO isolate, and it now drives the **entire real toolchain
+end to end** — not just the prebaked ToDo demo:
 
 ```bash
-node experiments/npm-in-workerd/workerd-bash/repl.mjs   # locates the fork binary itself
+node experiments/npm-in-workerd/workerd-bash/repl.mjs   # locates the fork binary itself; dev port 5190
 ```
+
+then, at the `workerd:/tmp/proj$` prompt:
+
+```bash
+npm create vite myapp -- --template react-ts          # REAL create-vite, run in a sub-isolate
+# repin the scaffolded app onto the workerd forks:
+sed -i 's#"vite": "[^"]*"#"vite": "npm:@netanelgilad/vite@8.0.16-workerd.0", "rolldown": "npm:@netanelgilad/rolldown@1.0.3-workerd.0"#' myapp/package.json
+cd myapp
+npm install                                            # the app's own deps, from public npm
+npm run dev                                            # the REAL vite bin serving myapp → open http://127.0.0.1:5190/
+sed -i 's/Vite + React/Vite in workerd/' src/App.tsx   # edit a component → it updates LIVE in the browser
+```
+
+Three primitives make this work — each *fixing a missing capability*, not
+scripting around the tool:
+
+- **`npm create` / `npm exec` / `npx`** run real `libnpmexec` + the real
+  `create-vite` bin via a `child_process.spawn` → **isolate-spawn bridge** (a
+  spawned process becomes a Worker-Loader child over the shared `/tmp`).
+- **`vite dev` / `npm run dev`** run the **real `vite` bin against the current
+  dir**, honoring the project's own `vite.config.ts` (no hand-rolled
+  `createServer`). The fork's `node:http` shim supplies the listening server
+  workerd has no primitive for.
+- **Live HMR**: workerd has no `fs.watch`, so the shell — which owns every edit —
+  drives Vite's real watcher on each write (`server.watcher.emit('change', …)`);
+  the resulting update reaches the browser over a `WebSocketPair` bridge to
+  Vite's real `ws` server. End-to-end verified in
+  [`workerd-bash/test-realbin-dev.mjs`](experiments/npm-in-workerd/workerd-bash/test-realbin-dev.mjs).
 
 ### Why a sub-isolate (and the constraint that shaped this)
 
@@ -380,6 +411,12 @@ Stated plainly so nothing reads as more finished than it is:
   shell/REPL demos you must `npm install` and `vite dev` in the same session.
 - **The Rolldown wasm is a prebuilt blob** (reproducible from committed patches,
   but not rebuilt by `setup.sh`).
+- **Live HMR is real but its connection is `waitUntil`-bounded.** The shell drives
+  Vite's real watcher on each edit and the update is pushed to the browser, but
+  the HMR WebSocket is served from a `ctx.waitUntil`-kept-alive context (workerd
+  won't let a later invocation send on a socket the upgrade accepted). So edits
+  land live within a window after each page load; a reload reconnects. The durable
+  fix is to host the socket in the DO with the WebSocket **Hibernation API**.
 
 ---
 

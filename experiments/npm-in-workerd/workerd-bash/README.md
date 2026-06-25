@@ -40,16 +40,37 @@ workerd:/tmp/proj$ npm install           # @netanelgilad/vite + ToDo deps from
                                          #   public npm (no args = the default set);
                                          #   `npm install left-pad react ...` for specifics
 workerd:/tmp/proj$ npm ls                # list installed packages
+workerd:/tmp/proj$ npm create vite myapp -- --template react-ts   # REAL create-vite in a sub-isolate
+workerd:/tmp/proj$ npm exec <pkg> / npx <pkg>   # real libnpmexec via the child_process->isolate bridge
 workerd:/tmp/proj$ scaffold              # write the ToDo app source into /tmp/proj
 workerd:/tmp/proj$ vite build            # build from /tmp in a child isolate; lists dist/
-workerd:/tmp/proj$ vite dev              # boot the dev server; PRINTS a URL to open
-workerd:/tmp/proj$ npm run dev           #   (alias for `vite dev`)
+workerd:/tmp/proj$ vite dev              # boot the REAL vite bin for the current dir; PRINTS a URL
+workerd:/tmp/proj$ npm run dev           #   (alias for `vite dev`; honors the project's own vite.config)
 workerd:/tmp/proj$ exit
 ```
 
-Typical flow: **`npm install` → `vite dev` → open the printed
-`http://127.0.0.1:5190/`** in your browser → the ToDo app, served by Vite running
-from `/tmp` inside the isolate.
+Two flows:
+
+**Quick (prebaked ToDo):** `npm install` → `vite dev` → open the printed
+`http://127.0.0.1:5190/` → the ToDo app, served by Vite running from `/tmp`.
+
+**Full (real `npm create` → live HMR):** scaffold a brand-new app and edit it live:
+
+```bash
+npm create vite myapp -- --template react-ts
+# repin the scaffolded app onto the workerd forks:
+sed -i 's#"vite": "[^"]*"#"vite": "npm:@netanelgilad/vite@8.0.16-workerd.0", "rolldown": "npm:@netanelgilad/rolldown@1.0.3-workerd.0"#' myapp/package.json
+cd myapp
+npm install
+npm run dev                                            # open http://127.0.0.1:5190/
+sed -i 's/Vite + React/Vite in workerd/' src/App.tsx   # → updates LIVE in the browser (HMR)
+```
+
+`npm create`/`exec`/`npx` run the real bins through a `child_process.spawn` →
+isolate-spawn bridge; `vite dev` runs the real `vite` bin against the cwd; and an
+edit to a component is reported to Vite's real watcher, so HMR pushes the update
+to the browser with no reload (workerd has no `fs.watch` — the shell, which owns
+every write, *is* the watch source).
 
 ## How it works
 
