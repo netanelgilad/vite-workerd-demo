@@ -3,7 +3,7 @@
 // DO instance, captures the instrumented summary (phases / connections / mem),
 // and exits. Designed to be run serially N times to characterize flakiness.
 //
-//   MINIFLARE_WORKERD_PATH=/Users/netanelg/Development/workerd-vfs.bin \
+//   MINIFLARE_WORKERD_PATH=~/path/to/workerd-vfs.bin \
 //     node install-only.mjs            # full vite tree
 //   SMALL=1 ... node install-only.mjs  # tiny tree (lodash)
 //

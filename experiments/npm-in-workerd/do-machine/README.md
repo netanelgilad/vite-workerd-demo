@@ -9,7 +9,7 @@ the VFS is in-memory and synchronous on the parent's thread.
 ## Run it
 
 ```bash
-# Fork binary built from /Users/netanelg/Development/workerd @ feat/vfs-module-loading.
+# Fork binary built from a checkout of github.com/netanelgilad/workerd @ feat/vfs-module-loading.
 # (Rebuild: `bazel build //src/workerd/server:workerd` then copy bazel-bin/.../workerd to
 #  /tmp/workerd-vfsmod-bin.)
 

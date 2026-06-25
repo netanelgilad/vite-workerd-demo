@@ -2,7 +2,7 @@
 // Runs ONE /install against a single DO instance, polls the durable /tmp/instr.log
 // frequently so we capture the LAST phase before any hang, and exits.
 //
-//   MINIFLARE_WORKERD_PATH=/Users/netanelg/Development/workerd-vfs.bin \
+//   MINIFLARE_WORKERD_PATH=~/path/to/workerd-vfs.bin \
 //     RUN_ID=base-1 node /tmp/install-probe/probe.mjs
 //   SMALL=1 ...   # tiny tree (lodash)
 //   MAXCONC=4 ... # cap outbound concurrency

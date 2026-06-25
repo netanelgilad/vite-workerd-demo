@@ -1,7 +1,13 @@
 # Publishing `@netanelgilad/rolldown` + `@netanelgilad/vite`
 
-These two packages are packed and validated locally but **NOT published** (this
-machine isn't logged in to npm). To publish once logged in:
+Both packages are **published on npm** (public, under the `@netanelgilad` scope):
+
+- [`@netanelgilad/rolldown@1.0.3-workerd.0`](https://www.npmjs.com/package/@netanelgilad/rolldown)
+- [`@netanelgilad/vite@8.0.16-workerd.0`](https://www.npmjs.com/package/@netanelgilad/vite)
+
+A clean `npm install @netanelgilad/vite` from public npm is all a consumer needs
+(it transitively pulls the rolldown fork via an npm alias). The steps below are
+the recipe used to (re)publish a new `-workerd.N` revision.
 
 ```bash
 # 0. Log in (scoped public packages under the @netanelgilad scope).
