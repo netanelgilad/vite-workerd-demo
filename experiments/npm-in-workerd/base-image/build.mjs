@@ -30,8 +30,12 @@ const SHIMS_DEST = path.join(STAGING, "usr/lib/workerd-shims");
 const SHIM = "/tmp/usr/lib/workerd-shims";
 // Specifier redirects baked into npm so the child loader resolves workerd-ready builtins.
 // (import.meta.url is NOT baked — the fork supplies it natively for VFS modules.)
+// Shrinking toward vanilla npm: v8 (heap_size_limit) and the pacote async-tar-write bug are
+// now fixed in the workerd fork (feat/vfs-module-loading: node:v8 getHeapStatistics +
+// fs async write callbacks), so those bakes are GONE. Remaining redirects map to fork
+// primitives not yet promoted: process (CJS-loader segfault), child_process (spawn→isolate
+// bridge), @npmcli/agent (https keepalive).
 const REDIRECTS = [
-  ["node:v8", `${SHIM}/v8.cjs`], ["v8", `${SHIM}/v8.cjs`],
   ["node:process", `${SHIM}/process.cjs`], ["process", `${SHIM}/process.cjs`],
   ["node:child_process", `${SHIM}/child_process.cjs`], ["child_process", `${SHIM}/child_process.cjs`],
   ["@npmcli/agent", `${SHIM}/npmcli-agent.cjs`],
@@ -41,56 +45,6 @@ const importSite = (spec) =>
 
 function bake(src, virtPath) {
   for (const [spec, target] of REDIRECTS) src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
-  // workerd native-fs loses tar's ASYNC write-callbacks -> reify hangs. pacote's #extract
-  // pipes the tarball into async tar.x(); rewrite it to buffer + extract synchronously.
-  if (virtPath.endsWith("/pacote/lib/fetcher.js")) {
-    src = src.replace(
-`  #extract (dest, tarball) {
-    const extractor = tar.x(this.#tarxOptions({ cwd: dest }))
-    const p = new Promise((resolve, reject) => {
-      extractor.on('end', () => {
-        resolve({
-          resolved: this.resolved,
-          integrity: this.integrity && String(this.integrity),
-          from: this.from,
-        })
-      })
-
-      extractor.on('error', er => {
-        log.warn('tar', er.message)
-        log.silly('tar', er)
-        reject(er)
-      })
-
-      tarball.on('error', er => reject(er))
-    })
-
-    tarball.pipe(extractor)
-    return p
-  }`,
-`  #extract (dest, tarball) {
-    return new Promise((resolve, reject) => {
-      const chunks = []
-      tarball.on('data', c => chunks.push(Buffer.from(c)))
-      tarball.on('error', er => reject(er))
-      tarball.on('end', () => {
-        try {
-          const buf = Buffer.concat(chunks)
-          tar.x({ ...this.#tarxOptions({ cwd: dest }), sync: true }).end(buf)
-          resolve({
-            resolved: this.resolved,
-            integrity: this.integrity && String(this.integrity),
-            from: this.from,
-          })
-        } catch (er) {
-          log.warn('tar', er.message)
-          log.silly('tar', er)
-          reject(er)
-        }
-      })
-    })
-  }`);
-  }
   return src;
 }
 
