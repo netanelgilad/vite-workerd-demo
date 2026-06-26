@@ -22,3 +22,7 @@ packages/vite/
 
 # prep-install-url uses a node_modules symlink into the npm-in-workerd experiment
 prep-install-url/node_modules
+
+# base-image build artifacts (regenerable from build.mjs)
+experiments/npm-in-workerd/base-image/.staging/
+experiments/npm-in-workerd/base-image/*.tar.gz
