@@ -30,6 +30,46 @@ function nodeProcessChild(probePath) {
     modules: { "main.js": `export { default } from ${JSON.stringify(probePath)};` },
   };
 }
+
+// The "node" shim: a sub-isolate that runs a bin as a supervised PROCESS. `drainProcess`
+// (workerd-fork primitive) runs the isolate to event-loop quiescence after run() returns;
+// the parent's `await child.run()` is waitpid. This is how we replace `node <script>`.
+function nodeProcessChildDrain(probePath) {
+  return {
+    compatibilityDate: CHILD_COMPAT_DATE, compatibilityFlags: CHILD_FLAGS, allowExperimental: true,
+    shareParentTmp: true, vfsModuleFallback: true, drainProcess: true, mainModule: "main.js",
+    modules: { "main.js": `export { default } from ${JSON.stringify(probePath)};` },
+  };
+}
+
+// Probe = a process `main`: set argv/cwd, then `require()` the bin fire-and-forget. require
+// is synchronous + in-context (dynamic import()'s microtask checkpoint would drop the
+// IoContext -> "global scope" error). Output is appended to a VFS log the DO reads after
+// the process exits (run() returns a snapshot BEFORE drainProcess runs npm's async work).
+function drainBinProbeSrc(binEntry, argv, cwd, outLog) {
+  return `
+  import { WorkerEntrypoint } from "cloudflare:workers";
+  export default class extends WorkerEntrypoint {
+    async run() {
+      const np = await import("node:process");
+      const nfs = await import("node:fs");
+      const mod = await import("node:module");
+      const OUT = ${JSON.stringify(outLog)};
+      try { nfs.writeFileSync(OUT, ""); } catch {}
+      const append = (s) => { try { nfs.appendFileSync(OUT, typeof s === "string" ? s : String(s)); } catch {} return true; };
+      for (const p of new Set([np.default, np, globalThis.process].filter(Boolean))) {
+        try { p.argv = ${JSON.stringify(argv)}.slice(); } catch {}
+        try { p.cwd = () => ${JSON.stringify(cwd)}; } catch { try { Object.defineProperty(p, "cwd", { configurable: true, value: () => ${JSON.stringify(cwd)} }); } catch {} }
+        try { if (p.stdin) p.stdin.isTTY = false; } catch {}
+      }
+      try { np.default.stdout.write = append; } catch {}
+      try { np.default.stderr.write = append; } catch {}
+      const require = mod.createRequire(${JSON.stringify(cwd + "/x.js")});
+      try { require(${JSON.stringify(binEntry)}); } catch (e) { append("[require threw] " + (e && e.stack || e) + "\\n"); }
+      return { started: true };
+    }
+  }`;
+}
 // The libnpmexec child: runs npm's REAL `npm exec` engine FROM THE VFS (vfsModuleFallback).
 // globalOutbound = the DO's SELF Fetcher, so the child's __ISOLATE_SPAWN can fetch back to
 // the DO's /isolate-spawn to run the create-vite bin (the child has no LOADER of its own).
@@ -253,6 +293,38 @@ export class NpmBaseImage {
     return { ms: Date.now() - t0, installed, pkgJson, run: res };
   }
 
+  // Run the LITERAL npm bin (fire-and-forget, exactly `node npm-cli.js install <pkg>`) in a
+  // drainProcess sub-isolate. This is "node <bin>" shimmed by a supervised sub-isolate — the
+  // bin isn't awaited by any code; the runtime runs the process to quiescence and the parent
+  // await is waitpid. No programmatic npm.exec, no userland poll loop.
+  async npmInstallBin(pkg) {
+    const fs = nodeFs;
+    const root = "/tmp/proj";
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync("/tmp/npmcache", { recursive: true });
+    // shebang-strip npm-cli.js (workerd's loader rejects a leading #!); require the stripped copy.
+    const bin = "/tmp/usr/lib/node_modules/npm/bin/npm-cli.js";
+    let entry = bin;
+    try {
+      const head = fs.readFileSync(bin, "utf8");
+      if (head.startsWith("#!")) { entry = "/tmp/usr/lib/node_modules/npm/bin/__nosheb_npm-cli.js"; fs.writeFileSync(entry, head.replace(/^#![^\n]*\n/, "//\n")); }
+    } catch {}
+    const argv = ["node", "npm", "install", pkg, "--ignore-scripts", "--no-audit", "--no-fund",
+      "--no-update-notifier", "--legacy-peer-deps", "--cache=/tmp/npmcache",
+      "--registry=https://registry.npmjs.org/", "--userconfig=/tmp/.npmrc-u", "--globalconfig=/tmp/.npmrc-g"];
+    const outLog = "/tmp/__npm_bin_out.log";
+    const probePath = "/tmp/__npm_bin_probe.mjs";
+    fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, root, outLog));
+    const t0 = Date.now();
+    const child = this.env.LOADER.get("npm-bin-runner", () => nodeProcessChildDrain(probePath));
+    const started = await child.getEntrypoint().run(); // waitpid: resolves after drainProcess drains npm
+    let installed = [];
+    try { installed = fs.readdirSync(root + "/node_modules").filter((n) => !n.startsWith(".")); } catch {}
+    let pkgJson = null; try { pkgJson = fs.readFileSync(root + "/package.json", "utf8"); } catch {}
+    let output = ""; try { output = fs.readFileSync(outLog, "utf8"); } catch {}
+    return { ms: Date.now() - t0, installed, pkgJson, output, started };
+  }
+
   // ---- `npm create vite` over the BASE IMAGE -------------------------------------------
   // `npm create vite` == `npm exec create-vite`. We drive npm's REAL `npm exec` engine
   // (libnpmexec) UNMODIFIED, loaded FROM THE VFS (/tmp/usr/...) — the same baked npm tree
@@ -413,6 +485,12 @@ export class NpmBaseImage {
         await this.boot();
         const pkg = url.searchParams.get("pkg") || "left-pad";
         return Response.json({ op: "npm-install", pkg, result: await this.npmInstall(pkg) });
+      }
+      if (url.pathname === "/npm-install-bin") {
+        await this.boot();
+        const pkg = url.searchParams.get("pkg") || "left-pad";
+        const result = await this.npmInstallBin(pkg);
+        return Response.json({ ok: Array.isArray(result.installed) && result.installed.includes(pkg), op: "npm-install-bin", pkg, result });
       }
       if (url.pathname === "/npm-create") {
         await this.boot();
