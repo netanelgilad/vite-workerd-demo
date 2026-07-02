@@ -32,8 +32,17 @@ const SHIM = "/tmp/usr/lib/workerd-shims";
 // (import.meta.url is NOT baked — the fork supplies it natively for VFS modules.)
 // Shrinking toward vanilla npm: v8 (heap_size_limit), the pacote async-tar-write bug, and
 // child_process (native spawn = sub-isolate, fork commits b5ec2a0/b20ee30) are now fork
-// primitives, so those bakes are GONE. Remaining redirects map to fork primitives not yet
-// promoted: process (CJS-loader segfault), @npmcli/agent (https keepalive).
+// primitives, so those bakes are GONE. Each remaining redirect = a named fork gap,
+// re-verified empirically on workerd-spawn.bin (delete the bake, rebake, run all flows):
+//
+// - process: CJS `require('node:process')` from a VFS module throws
+//   `No such module "node:process".` (first hit: npm-install-checks/lib/current-env.js:1,
+//   killing every npm install). The legacy registry's ESM resolveCallback special-cases
+//   node:process -> node-internal:{public,legacy}_process (jsg/modules.c++), but the CJS
+//   require path (api/commonjs.c++ CommonJsModuleContext::require) has no such redirect and
+//   node:process is not a registered builtin -> resolve fails. Fork follow-up: mirror the
+//   redirect in the CJS require path. (The bake's original motivation was a HOST-fallback
+//   CJS-loader segfault; that's gone — this resolution gap is what remains.)
 const REDIRECTS = [
   ["node:process", `${SHIM}/process.cjs`], ["process", `${SHIM}/process.cjs`],
   ["@npmcli/agent", `${SHIM}/npmcli-agent.cjs`],
