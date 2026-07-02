@@ -611,6 +611,27 @@ export class Shell {
         if (out !== src) fs.writeFileSync(f, out);
       } catch {}
     }
+    // Config discovery fix (re-root gap): vite's `bundleConfigFile` bundles the project's
+    // vite.config.ts via the low-level `rolldown({ input })` bundler, whose NATIVE (Rust/WASI
+    // oxc) entry resolver cannot resolve/stat entries on the fork's re-rooted (`/`) VFS — it
+    // fails EVERY entry (.js/.mjs/.ts) with [UNRESOLVED_ENTRY] even though the file exists to
+    // node:fs. (`vite.build` is unaffected because vite injects its own JS `resolveId` plugin;
+    // config bundling does not.) Inject a JS `resolveId`+`load` plugin that resolves the config
+    // entry and reads it via node:fs, bypassing the native resolver exactly the way vite.build
+    // already does. Config discovery stays real (real config + plugins, configLoader "bundle").
+    {
+      const f = root + "/node_modules/vite/dist/node/chunks/node.js";
+      try {
+        let src = fs.readFileSync(f, "utf8");
+        if (!src.includes("vfs-entry-resolve")) {
+          const out = src.replace(
+            /plugins:\s*\[\{\s*name:\s*"externalize-deps"/,
+            `plugins: [{ name: "vfs-entry-resolve", resolveId(id) { if (id === fileName) return id; }, load(id) { if (id === fileName) return fs.readFileSync(fileName, "utf8"); } }, { name: "externalize-deps"`,
+          );
+          if (out !== src) fs.writeFileSync(f, out);
+        }
+      } catch {}
+    }
     // Resolve node_modules/vite's bin + shebang-strip (workerd's loader rejects a leading #!).
     const pkg = JSON.parse(fs.readFileSync(root + "/node_modules/vite/package.json", "utf8"));
     const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin.vite;

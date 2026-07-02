@@ -9,5 +9,8 @@
   },
   "scripts": {
     "start": "node ./repl.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.61.1"
   }
 }
