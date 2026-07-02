@@ -1,7 +1,7 @@
 // BASE-IMAGE `npm create vite` runner. Same boot-the-rootfs harness as run.mjs, but it
-// drives the full real-npm scaffold flow over the BOOTED base image (npm in /tmp/usr):
+// drives the full real-npm scaffold flow over the BOOTED base image (npm in /usr):
 //
-//   1. /boot               extract the workerd-ready rootfs (npm) into the DO's native /tmp
+//   1. /boot               extract the workerd-ready rootfs (npm) into the VFS root (/usr, /etc)
 //   2. /npm-create         REAL `npm create vite myapp -- --template react-ts` — npm's own
 //                          libnpmexec (from the VFS) installs create-vite into the npx cache
 //                          and runs the genuine create-vite bin in a sub-isolate via
@@ -9,7 +9,7 @@
 //   3. /npm-install-app    repin vite->@netanelgilad/vite fork (+ add rolldown fork), then
 //                          REAL `npm install` inside myapp -> node_modules has vite+rolldown.
 //
-// There is NO host npm mount — if npm runs, it ran from the image in /tmp/usr.
+// There is NO host npm mount — if npm runs, it ran from the image in /usr.
 //   node base-image/build.mjs   # once, to build the image
 //   MINIFLARE_WORKERD_PATH=~/Development/workerd-stable.bin node base-image/run-create.mjs
 import { readFileSync, readdirSync, existsSync } from "node:fs";
@@ -73,7 +73,7 @@ async function call(p, label, ms = 240000) {
 const PROJECT = process.env.PROJECT || "myapp";
 let ok = false;
 try {
-  console.log("# BASE-IMAGE `npm create vite`: boot npm-in-/tmp/usr, then REAL npm create vite + npm install over it");
+  console.log("# BASE-IMAGE `npm create vite`: boot npm-in-/usr, then REAL npm create vite + npm install over it");
   await call("/boot", "BOOT: extract base image into the VFS", 120000);
 
   const cr = await call(`/npm-create?project=${PROJECT}&template=react-ts`,
@@ -83,7 +83,7 @@ try {
     crr.files.includes("package.json") && crr.files.some((f) => /^src\//.test(f)) &&
     crr.files.some((f) => /^src\/App\.tsx$/.test(f)) && crr.files.some((f) => /vite\.config\.ts$/.test(f));
   console.log(scaffoldOk
-    ? `\n  ->  REAL \`npm create vite\` scaffolded /tmp/proj/${PROJECT} (${crr.files.length} files): ${crr.files.join(", ")}\n`
+    ? `\n  ->  REAL \`npm create vite\` scaffolded /work/${PROJECT} (${crr.files.length} files): ${crr.files.join(", ")}\n`
     : `\n  ->  npm create vite ran but the scaffold looks incomplete; see result above.\n`);
   if (!scaffoldOk) throw new Error("scaffold incomplete — stopping before npm install");
 

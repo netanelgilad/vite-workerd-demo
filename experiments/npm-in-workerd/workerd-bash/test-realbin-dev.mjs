@@ -10,9 +10,9 @@ const sh = (l, r) => console.log(`$ ${l}\n  exit=${r.exitCode} ${r.stdout ? r.st
 let ok = false;
 try {
   await mf.ready;
-  sh("scaffold", await exec("scaffold", "/tmp/proj"));
-  sh("npm install", await exec("npm install", "/tmp/proj"));
-  sh("npm run dev", await exec("npm run dev", "/tmp/proj"));
+  sh("scaffold", await exec("scaffold", "/root/proj"));
+  sh("npm install", await exec("npm install", "/root/proj"));
+  sh("npm run dev", await exec("npm run dev", "/root/proj"));
 
   const base = `http://127.0.0.1:${PORT}`;
   let home = { status: 0 }, main = { status: 0 };
@@ -45,8 +45,8 @@ try {
   });
   await new Promise((r) => setTimeout(r, 1500)); // let it connect + receive 'connected'
 
-  console.log("\n$ sed -i 's/ToDo/ToDo Live/' src/App.tsx   (cwd /tmp/proj)");
-  const sedRes = await exec("sed -i 's/ToDo/ToDo Live/' src/App.tsx", "/tmp/proj");
+  console.log("\n$ sed -i 's/ToDo/ToDo Live/' src/App.tsx   (cwd /root/proj)");
+  const sedRes = await exec("sed -i 's/ToDo/ToDo Live/' src/App.tsx", "/root/proj");
   sh("sed App.tsx", sedRes);
   console.log("  HMR flush:", JSON.stringify(sedRes.hmr));
 

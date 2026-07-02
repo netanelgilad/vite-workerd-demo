@@ -34,8 +34,9 @@ const NPM_SRC = path.join(HERE, "..", "node_modules", "npm");
 const STAGING = path.join(HERE, ".staging");
 const NPM_DEST = path.join(STAGING, "usr/lib/node_modules/npm");
 
-// workerd's VFS is writable only under /tmp, so the rootfs lives at /tmp/usr (which is the
-// machine's writable disk). The launchers below reference npm by that absolute /tmp/usr path.
+// SPIKE (vfs-root-mount): workerd's VFS is now writable-rooted at "/", so the rootfs lives at the
+// real FHS path /usr (the machine's writable disk). The launchers below reference npm by that
+// absolute /usr path.
 
 console.log("# building base image (workerd-ready rootfs with npm)");
 rmSync(STAGING, { recursive: true, force: true });
@@ -46,12 +47,12 @@ cpSync(NPM_SRC, NPM_DEST, { recursive: true });
 // /usr/bin launchers: import the real bin from the VFS by absolute path (the launcher's own
 // location is irrelevant; the real bin's relative requires resolve from /usr/lib/...).
 mkdirSync(path.join(STAGING, "usr/bin"), { recursive: true });
-writeFileSync(path.join(STAGING, "usr/bin/npm"), `require("/tmp/usr/lib/node_modules/npm/bin/npm-cli.js");\n`);
-writeFileSync(path.join(STAGING, "usr/bin/npx"), `require("/tmp/usr/lib/node_modules/npm/bin/npx-cli.js");\n`);
+writeFileSync(path.join(STAGING, "usr/bin/npm"), `require("/usr/lib/node_modules/npm/bin/npm-cli.js");\n`);
+writeFileSync(path.join(STAGING, "usr/bin/npx"), `require("/usr/lib/node_modules/npm/bin/npx-cli.js");\n`);
 
 mkdirSync(path.join(STAGING, "etc"), { recursive: true });
 writeFileSync(path.join(STAGING, "etc/npmrc"),
-  "cache=/tmp/npmcache\nregistry=https://registry.npmjs.org/\nignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\nlegacy-peer-deps=true\n");
+  "cache=/root/.npm\nregistry=https://registry.npmjs.org/\nignore-scripts=true\naudit=false\nfund=false\nupdate-notifier=false\nlegacy-peer-deps=true\n");
 
 let files = 0, bytes = 0;
 (function count(d) { for (const e of readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) count(p); else { files++; bytes += statSync(p).size; } } })(STAGING);

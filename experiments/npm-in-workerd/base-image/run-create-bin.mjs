@@ -94,7 +94,7 @@ try {
     crr.files.includes("package.json") && crr.files.some((f) => /^src\//.test(f)) &&
     crr.files.some((f) => /^src\/App\.tsx$/.test(f)) && crr.files.some((f) => /vite\.config\.ts$/.test(f));
   console.log(scaffoldOk
-    ? `\n  ->  the LITERAL npm bin scaffolded /tmp/proj/${PROJECT} (${crr.files.length} files): ${crr.files.join(", ")}\n`
+    ? `\n  ->  the LITERAL npm bin scaffolded /work/${PROJECT} (${crr.files.length} files): ${crr.files.join(", ")}\n`
     : `\n  ->  npm create vite (literal bin) ran but the scaffold looks incomplete; see result above.\n`);
   if (!scaffoldOk) throw new Error("scaffold incomplete — stopping before npm install");
 

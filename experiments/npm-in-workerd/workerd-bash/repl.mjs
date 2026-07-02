@@ -16,7 +16,7 @@
 //   help
 //   pwd ; ls ; echo hi > note.txt ; cat note.txt
 //   npm install            # @netanelgilad/vite + ToDo deps from public npm (slow/flaky — retry if it hangs)
-//   scaffold               # write the ToDo app source into /tmp/proj
+//   scaffold               # write the ToDo app source into /root/proj
 //   vite build             # build from /tmp in a child isolate
 //   vite dev               # boot the dev server; prints a URL to open in your browser
 //   exit
@@ -57,7 +57,7 @@ const { mf, stats } = await createShellHarness({ verbose: process.env.VERBOSE ==
 await mf.ready;
 await mf.dispatchFetch("http://do.local/init");
 
-let cwd = "/tmp/proj";
+let cwd = "/root/proj";
 async function exec(cmd) {
   const res = await mf.dispatchFetch("http://do.local/exec", {
     method: "POST",
@@ -72,10 +72,10 @@ const HELP = `workerd-bash — a shell INTO a workerd v8 isolate over its shared
   filesystem (just-bash, real native /tmp inside the isolate):
     pwd  ls  cat  echo  mkdir  rm  cd  | pipes  > redirects
   toolchain:
-    npm install [pkgs...]   install into /tmp/proj/node_modules from public npm.
+    npm install [pkgs...]   install into /root/proj/node_modules from public npm.
                             no args -> @netanelgilad/vite + the ToDo app's deps.
     npm ls                  list installed packages
-    scaffold                write the ToDo app source into /tmp/proj
+    scaffold                write the ToDo app source into /root/proj
     vite build              build the app from /tmp in a child isolate
     vite dev                boot the dev server (from /tmp, in a child) and print a URL
     npm run dev             alias for vite dev
@@ -98,7 +98,7 @@ async function handle(cmd) {
   if (cmd === "stats") { console.log(JSON.stringify(stats())); return; }
   // local `cd` so the prompt + cwd track (just-bash exec is stateless per call)
   if (cmd === "cd" || cmd.startsWith("cd ")) {
-    const target = cmd === "cd" ? "/tmp/proj" : cmd.slice(3).trim();
+    const target = cmd === "cd" ? "/root/proj" : cmd.slice(3).trim();
     cwd = target.startsWith("/") ? path.normalize(target) : path.normalize(cwd.replace(/\/$/, "") + "/" + target);
     return;
   }

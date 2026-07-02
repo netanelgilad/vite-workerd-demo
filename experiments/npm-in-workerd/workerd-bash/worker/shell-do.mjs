@@ -4,26 +4,26 @@
 //
 //   - just-bash builtins over the DO's native /tmp: ls, cat, echo, mkdir, pwd, rm,
 //     pipes, redirects (via the NativeFsAdapter, shared with do-shell).
-//   - `npm install [pkgs...]` -> Arborist install into /tmp/proj/node_modules from
+//   - `npm install [pkgs...]` -> Arborist install into /root/proj/node_modules from
 //     the PUBLIC registry. Default (no args) installs @netanelgilad/vite + the ToDo
 //     app's deps (the exact set do-machine-clean proved buildable/serveable).
 //   - `npm create <init>` / `npm exec` / `npx`  -> REAL libnpmexec: install the pkg via
 //     Arborist, then run its bin in a child over /tmp via the child_process->isolate
 //     spawn bridge (e.g. `npm create vite myapp -- --template react-ts`).
-//   - `scaffold`                         -> write the app-todo source into /tmp/proj.
+//   - `scaffold`                         -> write the app-todo source into /root/proj.
 //   - `vite build`                       -> run vite build from /tmp in a child; list dist.
 //   - `vite dev` / `npm run dev`         -> boot the vite dev server in a child over /tmp,
 //                                           reachable on the bound miniflare port; print URL.
 //
 // The heavy toolchain (vite/rolldown) runs in a Worker-Loader CHILD that shares the
-// DO's /tmp (shareParentTmp) and resolves its module graph from /tmp/proj via the
+// DO's /tmp (shareParentTmp) and resolves its module graph from /root/proj via the
 // fork's `vfsModuleFallback`. npm install runs IN the DO (it has the module-fallback
 // service that resolves npm's own code from the host node_modules).
 import { Buffer } from "node:buffer";
 import * as nodeFs from "node:fs";
 
 const ARBORIST = "/tmp/xnm/npm/node_modules/@npmcli/arborist/lib/index.js";
-const PROJ = "/tmp/proj";
+const PROJ = "/root/proj";
 const CACHE = "/tmp/npmcache";
 
 // The dependency set @netanelgilad/vite + the ToDo app needs (proven by
@@ -116,7 +116,7 @@ function viteBuildChild() {
     shareParentTmp: true,
     vfsModuleFallback: true,
     mainModule: "main.js",
-    modules: { "main.js": `export { default } from "/tmp/proj/vite-build-probe.mjs";` },
+    modules: { "main.js": `export { default } from "/root/proj/vite-build-probe.mjs";` },
   };
 }
 
@@ -134,7 +134,7 @@ function viteDevChild(devPort) {
         import { WorkerEntrypoint } from "cloudflare:workers";
         let _impl;
         async function impl() {
-          if (!_impl) _impl = (await import("/tmp/proj/vite-dev-probe.mjs")).default;
+          if (!_impl) _impl = (await import("/root/proj/vite-dev-probe.mjs")).default;
           return _impl;
         }
         export default class extends WorkerEntrypoint {
@@ -337,7 +337,7 @@ export class Shell {
 
   // ---- toolchain ops (called by the shell `npm`/`scaffold`/`vite` commands) ----
 
-  // Public-registry install via Arborist into the DO's /tmp/proj/node_modules.
+  // Public-registry install via Arborist into the DO's /root/proj/node_modules.
   // Faithful to `npm install <pkgs>`: Arborist resolves+fetches from
   // https://registry.npmjs.org/ over workerd native fs (the tar sync-extract
   // workaround in the module-fallback host makes this work).
@@ -555,7 +555,7 @@ export class Shell {
           globalThis.__WAIT_UNTIL = (p) => { try { this.ctx.waitUntil(p); } catch {} };
           try {
             await import("rolldown/dist/rolldown-binding.wasi-browser.js").catch(async () => {
-              await import("/tmp/proj/node_modules/rolldown/dist/rolldown-binding.wasi-browser.js");
+              await import("/root/proj/node_modules/rolldown/dist/rolldown-binding.wasi-browser.js");
             });
             if (globalThis.__ROLLDOWN_ENSURE_READY) await globalThis.__ROLLDOWN_ENSURE_READY();
             await import("rolldown");
@@ -565,15 +565,15 @@ export class Shell {
             const { default: react } = await import("@vitejs/plugin-react");
             const t0 = Date.now();
             await vite.build({
-              root: "/tmp/proj", configFile: false, envFile: false, logLevel: "warn",
+              root: "/root/proj", configFile: false, envFile: false, logLevel: "warn",
               plugins: [react()],
-              build: { outDir: "/tmp/proj/dist", emptyOutDir: true, minify: false },
+              build: { outDir: "/root/proj/dist", emptyOutDir: true, minify: false },
             });
             out.ok = true;
             out.buildMs = Date.now() - t0;
             out.viteVersion = vite.version;
-            out.dist = nodeFs.readdirSync("/tmp/proj/dist");
-            try { out.assets = nodeFs.readdirSync("/tmp/proj/dist/assets"); } catch {}
+            out.dist = nodeFs.readdirSync("/root/proj/dist");
+            try { out.assets = nodeFs.readdirSync("/root/proj/dist/assets"); } catch {}
           } catch (e) {
             out.error = "vite.build: " + String(e);
             out.stack = (e && e.stack ? String(e.stack).split("\\n").slice(0,12) : []);
@@ -715,7 +715,7 @@ export class Shell {
     const doScaffold = async () => {
       try {
         const files = await self.scaffoldApp();
-        return { stdout: `scaffolded ToDo app -> /tmp/proj (${files} files: index.html, src/, tailwind/postcss config)\n`, stderr: "", exitCode: 0 };
+        return { stdout: `scaffolded ToDo app -> /root/proj (${files} files: index.html, src/, tailwind/postcss config)\n`, stderr: "", exitCode: 0 };
       } catch (e) { return { stdout: "", stderr: `scaffold failed: ${e}\n`, exitCode: 1 }; }
     };
     const scaffold = defineCommand("scaffold", doScaffold);

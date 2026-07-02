@@ -140,7 +140,7 @@ async function startRealVite(root, devPort) {
 async function ensureServing(env) {
   installGlobals(env);
   globalThis.__WAIT_UNTIL = (p) => { try { env.__ctx?.waitUntil(p); } catch {} };
-  const root = globalThis.__VITE_ROOT || "/tmp/proj";
+  const root = globalThis.__VITE_ROOT || "/root/proj";
   diagLog("ensureServing:start root=" + root + " bin=" + globalThis.__VITE_BIN);
   await bootRolldown(root);
   diagLog("rolldown booted");
@@ -325,7 +325,7 @@ export default class extends WorkerEntrypoint {
     try {
       this.env.__ctx = this.ctx;
       globalThis.__VITE_BIN = this.env.VITE_BIN;
-      globalThis.__VITE_ROOT = this.env.VITE_ROOT || "/tmp/proj";
+      globalThis.__VITE_ROOT = this.env.VITE_ROOT || "/root/proj";
       const t0 = Date.now();
       const server = await ensureServing(this.env);
       out.ok = true;
@@ -363,7 +363,7 @@ export default class extends WorkerEntrypoint {
   async fetch(request) {
     this.env.__ctx = this.ctx;
     globalThis.__VITE_BIN = this.env.VITE_BIN;
-    globalThis.__VITE_ROOT = this.env.VITE_ROOT || "/tmp/proj";
+    globalThis.__VITE_ROOT = this.env.VITE_ROOT || "/root/proj";
     try {
       const server = await ensureServing(this.env);
       const url = new URL(request.url);

@@ -31,22 +31,22 @@ Optional: `PORT=5191 node workerd-bash/repl.mjs` to change the dev-server port
 ## What you can type
 
 ```
-workerd:/tmp/proj$ help                 # the command list
-workerd:/tmp/proj$ pwd                   # /tmp/proj
-workerd:/tmp/proj$ echo hi > note.txt    # just-bash builtins over the isolate's
-workerd:/tmp/proj$ cat note.txt          #   real native /tmp: ls cat echo mkdir
-workerd:/tmp/proj$ ls sub | wc -l        #   rm cd, pipes, > and >> redirects
-workerd:/tmp/proj$ npm install           # the REAL npm CLI (npm.load()+exec('install'));
+workerd:/root/proj$ help                 # the command list
+workerd:/root/proj$ pwd                   # /root/proj
+workerd:/root/proj$ echo hi > note.txt    # just-bash builtins over the isolate's
+workerd:/root/proj$ cat note.txt          #   real native /tmp: ls cat echo mkdir
+workerd:/root/proj$ ls sub | wc -l        #   rm cd, pipes, > and >> redirects
+workerd:/root/proj$ npm install           # the REAL npm CLI (npm.load()+exec('install'));
                                          #   reifies the cwd's package.json from public npm.
                                          #   `npm install left-pad react ...` adds packages.
-workerd:/tmp/proj$ npm ls                # list installed packages
-workerd:/tmp/proj$ npm create vite myapp -- --template react-ts   # REAL create-vite in a sub-isolate
-workerd:/tmp/proj$ npm exec <pkg> / npx <pkg>   # real libnpmexec via the child_process->isolate bridge
-workerd:/tmp/proj$ scaffold              # write the ToDo app source into /tmp/proj
-workerd:/tmp/proj$ vite build            # build from /tmp in a child isolate; lists dist/
-workerd:/tmp/proj$ vite dev              # boot the REAL vite bin for the current dir; PRINTS a URL
-workerd:/tmp/proj$ npm run dev           #   (alias for `vite dev`; honors the project's own vite.config)
-workerd:/tmp/proj$ exit
+workerd:/root/proj$ npm ls                # list installed packages
+workerd:/root/proj$ npm create vite myapp -- --template react-ts   # REAL create-vite in a sub-isolate
+workerd:/root/proj$ npm exec <pkg> / npx <pkg>   # real libnpmexec via the child_process->isolate bridge
+workerd:/root/proj$ scaffold              # write the ToDo app source into /root/proj
+workerd:/root/proj$ vite build            # build from /tmp in a child isolate; lists dist/
+workerd:/root/proj$ vite dev              # boot the REAL vite bin for the current dir; PRINTS a URL
+workerd:/root/proj$ npm run dev           #   (alias for `vite dev`; honors the project's own vite.config)
+workerd:/root/proj$ exit
 ```
 
 Two flows:
@@ -82,13 +82,13 @@ every write, *is* the watch source).
   separate `/exec` requests the REPL fires per line). just-bash runs as the shell
   over it via a `NativeFsAdapter` (`worker/bash-native.mjs`).
 - `npm install` runs **in the DO** via npm's Arborist, fetching from
-  `https://registry.npmjs.org/` into `/tmp/proj/node_modules`. The DO has the
+  `https://registry.npmjs.org/` into `/root/proj/node_modules`. The DO has the
   module-fallback service (`host.mjs`) that resolves npm's own code from the host
   `node_modules`, plus the workerd workarounds (process shim, eval/Function/WASM
   rewrites, and the **tar sync-extract hack** that makes install work over native fs).
 - `vite build` / `vite dev` run **in a Worker-Loader CHILD** that shares the DO's
   `/tmp` (`shareParentTmp`) and resolves vite/rolldown's module graph directly from
-  `/tmp/proj` via the fork's **`vfsModuleFallback`**. The dev server runs in
+  `/root/proj` via the fork's **`vfsModuleFallback`**. The dev server runs in
   middleware mode; the DO proxies every browser request (and the `/__hmr`
   WebSocket) to the child over RPC.
 - The dev path **self-heals**: miniflare can route a port request to a DO instance

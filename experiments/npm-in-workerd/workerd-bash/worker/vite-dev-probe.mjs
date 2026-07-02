@@ -5,8 +5,8 @@
 // vite runs in middlewareMode and we adapt workerd Request/Response to vite's connect stack.
 //
 // This is the do-machine port of harness/worker/driver.mjs's dev path, but with vite
-// loaded from native /tmp (not memfs) and rooted at /tmp/proj. It lives UNDER /tmp/proj so
-// its bare imports ("vite", "@vitejs/plugin-react") resolve against /tmp/proj/node_modules.
+// loaded from native /tmp (not memfs) and rooted at /root/proj. It lives UNDER /root/proj so
+// its bare imports ("vite", "@vitejs/plugin-react") resolve against /root/proj/node_modules.
 import { Buffer } from "node:buffer";
 import * as nodeFs from "node:fs";
 import path from "node:path";
@@ -77,7 +77,7 @@ async function bootRolldown() {
   // CLEAN: do NOT preset __ROLLDOWN_WASM_BYTES. The installed @netanelgilad/rolldown ships
   // dist/rolldown.wasm and the binding loads it via import.meta.url (workerd VFS loader
   // supplies a correct import.meta.url) -> readFileSync(fileURLToPath(new URL("./rolldown.wasm", ...))).
-  await import("/tmp/proj/node_modules/rolldown/dist/rolldown-binding.wasi-browser.js");
+  await import("/root/proj/node_modules/rolldown/dist/rolldown-binding.wasi-browser.js");
   if (globalThis.__ROLLDOWN_ENSURE_READY) await globalThis.__ROLLDOWN_ENSURE_READY();
   await import("rolldown");
   booted = true;
@@ -128,7 +128,7 @@ async function inlineConfig(devPort) {
   // proxies the /__hmr upgrade to this child.
   const clientPort = devPort ? Number(devPort) : undefined;
   return {
-    root: "/tmp/proj",
+    root: "/root/proj",
     configFile: false,
     envFile: false,
     mode: "development",
@@ -237,7 +237,7 @@ export default class extends WorkerEntrypoint {
       // CLEAN: esbuild is the workerd-wasm shim bundled inside @netanelgilad/vite
       // (node_modules/vite/node_modules/esbuild-wasm/esm/workerd-shim.mjs). Warm it directly
       // (vite's own dist import("esbuild") was baked to this same shim path).
-      const esb = await import("/tmp/proj/node_modules/vite/node_modules/esbuild-wasm/esm/workerd-shim.mjs");
+      const esb = await import("/root/proj/node_modules/vite/node_modules/esbuild-wasm/esm/workerd-shim.mjs");
       await esb.transform("let x = 1", { loader: "ts" });
       out.stage = "transform-main";
       const tr = await server.transformRequest("/src/main.tsx");

@@ -11,7 +11,7 @@
 // Bare specifiers resolve against the npm root first, the just-bash root second.
 // The vite-dev / vite-build CHILD isolates do NOT use this service — they use the
 // fork's `vfsModuleFallback` to import vite/rolldown directly from the DO's own
-// /tmp/proj/node_modules (the registry-installed tree). All the workerd
+// /root/proj/node_modules (the registry-installed tree). All the workerd
 // source-rewrite workarounds (process shim, eval/Function/WASM rewrites, the tar
 // sync-extract hack that makes npm install work over native fs) are kept verbatim
 // from do-shell/shell-host.mjs + do-machine-clean/host-do.mjs.
@@ -264,7 +264,7 @@ function moduleFallback(request) {
   }
 }
 
-// The DO needs the ToDo app source (to scaffold into /tmp/proj) and the dev-server
+// The DO needs the ToDo app source (to scaffold into /root/proj) and the dev-server
 // probe source. We serve both over a service binding so the DO can pull them without
 // a host mount (the app source lives outside the mounted node_modules roots).
 const APP_TODO = path.join(REPO, "app-todo");

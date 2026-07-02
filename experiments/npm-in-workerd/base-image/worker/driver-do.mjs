@@ -7,12 +7,13 @@ import * as nodeFs from "node:fs";
 
 const CHILD_FLAGS = ["nodejs_compat", "nodejs_compat_v2", "experimental", "enable_nodejs_fs_module"];
 const CHILD_COMPAT_DATE = "2026-06-01";
-const NPM_BIN = "/tmp/usr/lib/node_modules/npm/bin/npm-cli.js";
+// SPIKE (vfs-root-mount): rootfs at real FHS /usr, caches/config under /root — NOT under /tmp.
+const NPM_BIN = "/usr/lib/node_modules/npm/bin/npm-cli.js";
 // The standard npm CLI config flags every literal-bin invocation carries (same set the
 // awaited programmatic flows used).
 const NPM_CONFIG_FLAGS = ["--ignore-scripts", "--no-audit", "--no-fund", "--no-update-notifier",
-  "--legacy-peer-deps", "--cache=/tmp/npmcache", "--registry=https://registry.npmjs.org/",
-  "--userconfig=/tmp/.npmrc-u", "--globalconfig=/tmp/.npmrc-g"];
+  "--legacy-peer-deps", "--cache=/root/.npm", "--registry=https://registry.npmjs.org/",
+  "--userconfig=/root/.npmrc-u", "--globalconfig=/root/.npmrc-g"];
 
 // workerd's module loader rejects a leading #! — write a stripped sibling and load that.
 function shebangStripped(fs, bin) {
@@ -108,7 +109,7 @@ function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnEnv = false) {
         try { p.cwd = () => ${JSON.stringify(cwd)}; } catch { try { Object.defineProperty(p, "cwd", { configurable: true, value: () => ${JSON.stringify(cwd)} }); } catch {} }
         try { if (p.stdin) p.stdin.isTTY = false; } catch {}
         try { p.exit = exitFn; } catch {}
-        ${withSpawnEnv ? `try { p.env = Object.assign(p.env || {}, { PATH: "/usr/bin:/bin", HOME: "/tmp" }); } catch {}
+        ${withSpawnEnv ? `try { p.env = Object.assign(p.env || {}, { PATH: "/usr/bin:/bin", HOME: "/root" }); } catch {}
         try { Object.defineProperty(p, "report", { configurable: true, value: reportStub }); } catch {}` : ""}
       }
       // honor write(chunk, [enc], cb) callbacks — npm's exit-handler flushes stdout/stderr
@@ -190,7 +191,7 @@ export class NpmBaseImage {
     const manifest = await res.json();
     let files = 0;
     for (const [rel, b64] of Object.entries(manifest)) {
-      const p = "/tmp/" + rel; // VFS is writable under /tmp -> rootfs at /tmp/usr
+      const p = "/" + rel; // SPIKE: VFS writable at "/" -> rootfs at real FHS paths (/usr, /etc)
       fs.mkdirSync(p.slice(0, p.lastIndexOf("/")), { recursive: true });
       fs.writeFileSync(p, Buffer.from(b64, "base64"));
       files++;
@@ -204,11 +205,11 @@ export class NpmBaseImage {
   // "global scope" error, same lesson as vite's cac bin).
   async npmInstall(pkg) {
     const fs = nodeFs;
-    const root = "/tmp/proj";
+    const root = "/work";
     fs.mkdirSync(root, { recursive: true });
-    fs.mkdirSync("/tmp/npmcache", { recursive: true });
+    fs.mkdirSync("/root/.npm", { recursive: true });
     const argv = ["node", "npm", "install", pkg, ...NPM_CONFIG_FLAGS];
-    const probePath = "/tmp/__npm_probe.mjs";
+    const probePath = "/root/__npm_probe.mjs";
     fs.writeFileSync(probePath, `
       import { WorkerEntrypoint } from "cloudflare:workers";
       export default class extends WorkerEntrypoint {
@@ -224,7 +225,7 @@ export class NpmBaseImage {
           try { np.default.stderr.write = (s) => { err.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
           let error = null;
           try {
-            const NpmMod = await import("/tmp/usr/lib/node_modules/npm/lib/npm.js");
+            const NpmMod = await import("/usr/lib/node_modules/npm/lib/npm.js");
             const Npm = NpmMod.default || NpmMod;
             const npm = new Npm();
             const { command, args } = await npm.load();
@@ -248,14 +249,14 @@ export class NpmBaseImage {
   // await is waitpid. No programmatic npm.exec, no userland poll loop.
   async npmInstallBin(pkg) {
     const fs = nodeFs;
-    const root = "/tmp/proj";
+    const root = "/work";
     fs.mkdirSync(root, { recursive: true });
-    fs.mkdirSync("/tmp/npmcache", { recursive: true });
+    fs.mkdirSync("/root/.npm", { recursive: true });
     // shebang-strip npm-cli.js (workerd's loader rejects a leading #!); require the stripped copy.
     const entry = shebangStripped(fs, NPM_BIN);
     const argv = ["node", "npm", "install", pkg, ...NPM_CONFIG_FLAGS];
-    const outLog = "/tmp/__npm_bin_out.log";
-    const probePath = "/tmp/__npm_bin_probe.mjs";
+    const outLog = "/root/__npm_bin_out.log";
+    const probePath = "/root/__npm_bin_probe.mjs";
     fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, root, outLog));
     const t0 = Date.now();
     const child = this.env.LOADER.get("npm-bin-runner", () => nodeProcessChildDrain(probePath));
@@ -269,7 +270,7 @@ export class NpmBaseImage {
 
   // ---- `npm create vite` over the BASE IMAGE -------------------------------------------
   // `npm create vite` == `npm exec create-vite`. We drive npm's REAL `npm exec` engine
-  // (libnpmexec) UNMODIFIED, loaded FROM THE VFS (/tmp/usr/...) — the same baked npm tree
+  // (libnpmexec) UNMODIFIED, loaded FROM THE VFS (/usr/...) — the same baked npm tree
   // boot laid down, NOT a host mount. libnpmexec resolves+installs create-vite into the npx
   // cache (Arborist + pacote over the VFS), then spawns the real create-vite bin.
   //
@@ -284,25 +285,25 @@ export class NpmBaseImage {
   // DO has no module-fallback service), which is why libnpmexec runs one level down.
   async npmCreateVite(project = "myapp", template = "react-ts") {
     const fs = nodeFs;
-    const runPath = "/tmp/proj";
+    const runPath = "/work";
     fs.mkdirSync(runPath, { recursive: true });
-    fs.mkdirSync("/tmp/npxcache", { recursive: true });
-    fs.mkdirSync("/tmp/npmcache", { recursive: true });
+    fs.mkdirSync("/root/.npx", { recursive: true });
+    fs.mkdirSync("/root/.npm", { recursive: true });
     try { fs.rmSync(runPath + "/" + project, { recursive: true, force: true }); } catch {}
     const t0 = Date.now();
-    const NPM_NM = "/tmp/usr/lib/node_modules/npm/node_modules";
+    const NPM_NM = "/usr/lib/node_modules/npm/node_modules";
     const opts = {
       // `npm create vite myapp -- --template react-ts` -> exec create-vite with these argv.
       args: ["create-vite", project, "--template", template, "--no-interactive"],
       packages: ["create-vite"],
       path: runPath, runPath, yes: true,
       localBin: runPath + "/node_modules/.bin", globalBin: "", scriptShell: "sh",
-      registry: "https://registry.npmjs.org/", cache: "/tmp/npmcache", npxCache: "/tmp/npxcache",
+      registry: "https://registry.npmjs.org/", cache: "/root/.npm", npxCache: "/root/.npx",
       // Accommodations a real Node provides for free (none alter npm/bin logic):
       nodeGyp: NPM_NM + "/node-gyp/bin/node-gyp.js",
       env: { PATH: "/usr/bin:/bin" },
     };
-    const probePath = "/tmp/__libnpmexec_probe.mjs";
+    const probePath = "/root/__libnpmexec_probe.mjs";
     fs.writeFileSync(probePath, libnpmexecProbeSrc(NPM_NM + "/libnpmexec/lib/index.js", opts));
     const child = this.env.LOADER.get("libnpmexec-create", () => libnpmexecChild(probePath));
     const run = await child.getEntrypoint().run();
@@ -353,12 +354,12 @@ export class NpmBaseImage {
 
   async npmInstallApp(project = "myapp") {
     const fs = nodeFs;
-    const target = "/tmp/proj/" + project;
+    const target = "/work/" + project;
     if (!fs.existsSync(target + "/package.json")) throw new Error("no scaffold at " + target);
     this.repinScaffold(fs, target);
 
     const argv = ["node", "npm", "install", ...NPM_CONFIG_FLAGS];
-    const probePath = "/tmp/__npm_install_app_probe.mjs";
+    const probePath = "/root/__npm_install_app_probe.mjs";
     fs.writeFileSync(probePath, `
       import { WorkerEntrypoint } from "cloudflare:workers";
       export default class extends WorkerEntrypoint {
@@ -374,7 +375,7 @@ export class NpmBaseImage {
           try { np.default.stderr.write = (s) => { err.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
           let error = null;
           try {
-            const NpmMod = await import("/tmp/usr/lib/node_modules/npm/lib/npm.js");
+            const NpmMod = await import("/usr/lib/node_modules/npm/lib/npm.js");
             const Npm = NpmMod.default || NpmMod;
             const npm = new Npm();
             const { command, args } = await npm.load();
@@ -407,9 +408,9 @@ export class NpmBaseImage {
   // spawnBegin/spawnEnd waitpid bracket keeps the drain alive across it.
   async npmCreateViteBin(project = "myapp", template = "react-ts") {
     const fs = nodeFs;
-    const runPath = "/tmp/proj";
+    const runPath = "/work";
     fs.mkdirSync(runPath, { recursive: true });
-    fs.mkdirSync("/tmp/npmcache", { recursive: true });
+    fs.mkdirSync("/root/.npm", { recursive: true });
     try { fs.rmSync(runPath + "/" + project, { recursive: true, force: true }); } catch {}
     const entry = shebangStripped(fs, NPM_BIN);
     // Literal CLI argv for `npm create vite myapp -- --template react-ts --no-interactive`:
@@ -420,10 +421,10 @@ export class NpmBaseImage {
     // accommodation the awaited flow makes by passing `nodeGyp` into libexec directly);
     // args after `--` go verbatim to the create-vite bin.
     const argv = ["node", "npm", "create", "vite", project, "--yes", "--script-shell=sh",
-      "--node-gyp=/tmp/usr/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js",
+      "--node-gyp=/usr/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js",
       ...NPM_CONFIG_FLAGS, "--", "--template", template, "--no-interactive"];
-    const outLog = "/tmp/__npm_create_bin_out.log";
-    const probePath = "/tmp/__npm_create_bin_probe.mjs";
+    const outLog = "/root/__npm_create_bin_out.log";
+    const probePath = "/root/__npm_create_bin_probe.mjs";
     fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, runPath, outLog, true));
     const t0 = Date.now();
     const child = this.env.LOADER.get("npm-create-bin-runner", () => nodeProcessChildDrain(probePath));
@@ -444,13 +445,13 @@ export class NpmBaseImage {
   // No spawn happens here: --ignore-scripts means npm spawns nothing during install.
   async npmInstallAppBin(project = "myapp") {
     const fs = nodeFs;
-    const target = "/tmp/proj/" + project;
+    const target = "/work/" + project;
     if (!fs.existsSync(target + "/package.json")) throw new Error("no scaffold at " + target);
     this.repinScaffold(fs, target);
     const entry = shebangStripped(fs, NPM_BIN);
     const argv = ["node", "npm", "install", ...NPM_CONFIG_FLAGS];
-    const outLog = "/tmp/__npm_install_app_bin_out.log";
-    const probePath = "/tmp/__npm_install_app_bin_probe.mjs";
+    const outLog = "/root/__npm_install_app_bin_out.log";
+    const probePath = "/root/__npm_install_app_bin_probe.mjs";
     fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, target, outLog));
     const t0 = Date.now();
     const child = this.env.LOADER.get("npm-install-app-bin-runner", () => nodeProcessChildDrain(probePath));
