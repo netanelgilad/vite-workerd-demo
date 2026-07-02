@@ -367,6 +367,27 @@ export default class extends WorkerEntrypoint {
     try {
       const server = await ensureServing(this.env);
       const url = new URL(request.url);
+      // DIAGNOSTIC: probe vite's resolve/transform pipeline for the URL path the browser
+      // requests (/src/main.tsx) and the follow-on relative css import. Temporary — used to
+      // pin the re-root resolver mechanism; safe to remove.
+      if (url.pathname === "/__diag") {
+        const root = globalThis.__VITE_ROOT || "/root/proj";
+        const env = server.environments?.client;
+        const pc = env?.pluginContainer;
+        const out = { root, hasEnv: !!env, hasPc: !!pc, steps: [] };
+        const push = (k, v) => out.steps.push({ [k]: v });
+        const rid = (r) => (r == null ? null : (typeof r === "string" ? r : (r.id ?? r)));
+        try { push("resolveId('/src/main.tsx', undefined)", rid(await pc.resolveId("/src/main.tsx", undefined, {}))); } catch (e) { push("resolveId('/src/main.tsx') THREW", String(e && e.stack || e)); }
+        try { push("resolveId('/src/main.tsx', index.html)", rid(await pc.resolveId("/src/main.tsx", root + "/index.html", {}))); } catch (e) { push("resolveId(main w/ html importer) THREW", String(e && e.stack || e)); }
+        try { push("resolveId('./index.css', root/src/main.tsx)", rid(await pc.resolveId("./index.css", root + "/src/main.tsx", {}))); } catch (e) { push("resolveId('./index.css') THREW", String(e && e.stack || e)); }
+        push("fs.existsSync(/src/main.tsx)", nodeFs.existsSync("/src/main.tsx"));
+        push("fs.existsSync(root/src/main.tsx)", nodeFs.existsSync(root + "/src/main.tsx"));
+        push("fs.existsSync(/src/index.css)", nodeFs.existsSync("/src/index.css"));
+        const tr = async (u) => { const f = env?.transformRequest ? env.transformRequest.bind(env) : server.transformRequest.bind(server); const r = await f(u); return r ? { codeLen: r.code?.length, head: (r.code || "").slice(0, 140) } : null; };
+        try { push("transformRequest('/src/main.tsx')", await tr("/src/main.tsx")); } catch (e) { push("transformRequest('/src/main.tsx') THREW", String(e && e.stack || e)); }
+        try { push("transformRequest(root/src/main.tsx)", await tr(root + "/src/main.tsx")); } catch (e) { push("transformRequest(root/src/main.tsx) THREW", String(e && e.stack || e)); }
+        return Response.json(out);
+      }
       // HMR WebSocket: hand the upgrade to vite's real ws server via the Duplex bridge.
       if ((request.headers.get("Upgrade") || "").toLowerCase() === "websocket") {
         const [client, srv] = Object.values(new WebSocketPair());
