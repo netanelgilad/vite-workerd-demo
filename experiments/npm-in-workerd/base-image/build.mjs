@@ -45,6 +45,13 @@ const importSite = (spec) =>
 
 function bake(src, virtPath) {
   for (const [spec, target] of REDIRECTS) src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
+  // workerd's CJS require has no .resolve — bake relative require.resolve('./x') calls into
+  // the absolute VFS path they'd resolve to (e.g. init-package-json's module-level
+  // require.resolve('./default-input.js'), hit by `npm create` when it loads commands/init).
+  // Non-relative sites are left alone (they're try/caught or covered by config flags).
+  const virtDir = path.posix.dirname(virtPath);
+  src = src.replace(/\brequire\.resolve\(\s*(['"])(\.{1,2}\/[^'"]+)\1\s*\)/g,
+    (m, q, rel) => JSON.stringify(path.posix.normalize(`${virtDir}/${rel}`)));
   return src;
 }
 

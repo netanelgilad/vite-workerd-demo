@@ -7,6 +7,26 @@ import * as nodeFs from "node:fs";
 
 const CHILD_FLAGS = ["nodejs_compat", "nodejs_compat_v2", "experimental", "enable_nodejs_fs_module"];
 const CHILD_COMPAT_DATE = "2026-06-01";
+const NPM_BIN = "/tmp/usr/lib/node_modules/npm/bin/npm-cli.js";
+// The standard npm CLI config flags every literal-bin invocation carries (same set the
+// awaited programmatic flows used).
+const NPM_CONFIG_FLAGS = ["--ignore-scripts", "--no-audit", "--no-fund", "--no-update-notifier",
+  "--legacy-peer-deps", "--cache=/tmp/npmcache", "--registry=https://registry.npmjs.org/",
+  "--userconfig=/tmp/.npmrc-u", "--globalconfig=/tmp/.npmrc-g"];
+
+// workerd's module loader rejects a leading #! — write a stripped sibling and load that.
+function shebangStripped(fs, bin) {
+  try {
+    const head = fs.readFileSync(bin, "utf8");
+    if (head.startsWith("#!")) {
+      const s = bin.lastIndexOf("/");
+      const stripped = bin.slice(0, s + 1) + "__nosheb_" + bin.slice(s + 1);
+      fs.writeFileSync(stripped, head.replace(/^#![^\n]*\n/, "//\n"));
+      return stripped;
+    }
+  } catch {}
+  return bin;
+}
 
 function installGlobals(env) {
   globalThis.__UNSAFE_EVAL = env.UNSAFE_EVAL;
@@ -34,10 +54,13 @@ function nodeProcessChild(probePath) {
 // The "node" shim: a sub-isolate that runs a bin as a supervised PROCESS. `drainProcess`
 // (workerd-fork primitive) runs the isolate to event-loop quiescence after run() returns;
 // the parent's `await child.run()` is waitpid. This is how we replace `node <script>`.
-function nodeProcessChildDrain(probePath) {
+// Optional selfFetcher (= the DO's SELF binding) becomes the child's globalOutbound so a
+// spawn bridge inside the child can fetch BACK to the DO's /isolate-spawn (npm create).
+function nodeProcessChildDrain(probePath, selfFetcher) {
   return {
     compatibilityDate: CHILD_COMPAT_DATE, compatibilityFlags: CHILD_FLAGS, allowExperimental: true,
     shareParentTmp: true, vfsModuleFallback: true, drainProcess: true, mainModule: "main.js",
+    ...(selfFetcher ? { globalOutbound: selfFetcher } : {}),
     modules: { "main.js": `export { default } from ${JSON.stringify(probePath)};` },
   };
 }
@@ -46,7 +69,38 @@ function nodeProcessChildDrain(probePath) {
 // is synchronous + in-context (dynamic import()'s microtask checkpoint would drop the
 // IoContext -> "global scope" error). Output is appended to a VFS log the DO reads after
 // the process exits (run() returns a snapshot BEFORE drainProcess runs npm's async work).
-function drainBinProbeSrc(binEntry, argv, cwd, outLog) {
+//
+// KEEPALIVE (fork-primitive gap, measured): drainProcess's quiescence check counts pending
+// TIMERS but NOT in-flight socket/HTTP I/O. A drain whose only remaining work is a network
+// read ends immediately (a bare https.get dies ~20ms into the drain; the same 15 MB
+// packument body streams fully in ~1.6s if any timer chain is live). npm only survived
+// small installs by riding incidental timers. Until the fork counts I/O as work, the probe
+// emulates node's active-handle refcount: a timer chain keeps the process alive until the
+// bin calls process.exit (npm's exit-handler always does) or a hard deadline passes.
+//
+// withSpawnBridge (used by `npm create` via the literal bin): install __ISOLATE_SPAWN so
+// npm's baked child_process shim can spawn create-vite — the fetch goes over the child's
+// globalOutbound (= the DO's SELF Fetcher) back to /isolate-spawn. Critically, npm calls
+// spawn AFTER run() returns, i.e. DURING the drain phase — drainProcess keeps the
+// IoContext bound so the fetch still works; any failure is appended to the log verbatim.
+// Also sets env.PATH (so @npmcli/run-script's setPATH has a PATH key to prepend the npx
+// .bin dirs to — workerd's process.env has none) and stubs process.report (the
+// npm-install-checks libc probe segfaults workerd; same guard as the libnpmexec child).
+function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnBridge = false) {
+  const bridge = !withSpawnBridge ? "" : `
+      globalThis.__ISOLATE_SPAWN = async (file, args, options = {}) => {
+        try {
+          const r = await fetch("http://self/isolate-spawn", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ file, args, options: { cwd: options.cwd, env: options.env } }),
+          });
+          return await r.json();
+        } catch (e) {
+          append("[__ISOLATE_SPAWN failed during drain] " + (e && e.stack || e) + "\\n");
+          return { code: 1, signal: null, stdout: "", stderr: "isolate-spawn bridge failed: " + String(e) };
+        }
+      };
+      const reportStub = { excludeNetwork: true, getReport: () => ({ header: {}, sharedObjects: [] }) };`;
   return `
   import { WorkerEntrypoint } from "cloudflare:workers";
   export default class extends WorkerEntrypoint {
@@ -57,13 +111,32 @@ function drainBinProbeSrc(binEntry, argv, cwd, outLog) {
       const OUT = ${JSON.stringify(outLog)};
       try { nfs.writeFileSync(OUT, ""); } catch {}
       const append = (s) => { try { nfs.appendFileSync(OUT, typeof s === "string" ? s : String(s)); } catch {} return true; };
+      // A rejection nobody awaits would otherwise kill the drain silently — log it.
+      const logReason = (tag) => (r) => append("[" + tag + "] " + (r && (r.stack || r.reason && (r.reason.stack || r.reason) || r)) + "\\n");
+      try { globalThis.addEventListener("unhandledrejection", logReason("unhandledrejection")); } catch {}
+      try { globalThis.addEventListener("error", logReason("uncaught error")); } catch {}
+      try { np.default.on && np.default.on("unhandledRejection", logReason("process unhandledRejection")); } catch {}
+      try { np.default.on && np.default.on("uncaughtException", logReason("process uncaughtException")); } catch {}${bridge}
+      let exitCode = null;
+      const exitFn = (c) => { if (exitCode === null) { exitCode = c == null ? 0 : c; append("[process exited code=" + exitCode + "]\\n"); } };
       for (const p of new Set([np.default, np, globalThis.process].filter(Boolean))) {
         try { p.argv = ${JSON.stringify(argv)}.slice(); } catch {}
         try { p.cwd = () => ${JSON.stringify(cwd)}; } catch { try { Object.defineProperty(p, "cwd", { configurable: true, value: () => ${JSON.stringify(cwd)} }); } catch {} }
         try { if (p.stdin) p.stdin.isTTY = false; } catch {}
+        try { p.exit = exitFn; } catch {}
+        ${withSpawnBridge ? `try { p.env = Object.assign(p.env || {}, { PATH: "/usr/bin:/bin", HOME: "/tmp" }); } catch {}
+        try { Object.defineProperty(p, "report", { configurable: true, value: reportStub }); } catch {}` : ""}
       }
-      try { np.default.stdout.write = append; } catch {}
-      try { np.default.stderr.write = append; } catch {}
+      // honor write(chunk, [enc], cb) callbacks — npm's exit-handler flushes stdout/stderr
+      // with empty writes and only calls process.exit from the write callback chain.
+      const writeFn = (s, enc, cb) => { append(s); const f = typeof enc === "function" ? enc : cb; if (typeof f === "function") queueMicrotask(f); return true; };
+      try { np.default.stdout.write = writeFn; } catch {}
+      try { np.default.stderr.write = writeFn; } catch {}
+      // active-handle keepalive: sustain the drain (timers count as work, sockets don't)
+      // until the bin exits; the chain then stops and the drain reaches quiescence.
+      const DEADLINE = Date.now() + 240000;
+      const keepalive = () => { if (exitCode === null && Date.now() < DEADLINE) setTimeout(keepalive, 200); };
+      setTimeout(keepalive, 200);
       const require = mod.createRequire(${JSON.stringify(cwd + "/x.js")});
       try { require(${JSON.stringify(binEntry)}); } catch (e) { append("[require threw] " + (e && e.stack || e) + "\\n"); }
       return { started: true };
@@ -217,7 +290,6 @@ export class NpmBaseImage {
   // (avoids the async tar-write bug). After this, /usr/... lives in the VFS.
   async boot() {
     const fs = nodeFs;
-    const NPM_BIN = "/tmp/usr/lib/node_modules/npm/bin/npm-cli.js";
     if (fs.existsSync(NPM_BIN)) return { ok: true, cached: true };
     const res = await this.env.HOST.fetch("http://host/image-manifest");
     const manifest = await res.json();
@@ -235,11 +307,7 @@ export class NpmBaseImage {
   // isolateSpawn() to launch the create-vite bin the libnpmexec child asked us to spawn.
   async runNodeChild(entry, args, options) {
     const fs = nodeFs;
-    let realEntry = entry;
-    try {
-      const head = fs.readFileSync(entry, "utf8");
-      if (head.startsWith("#!")) { const s = entry.lastIndexOf("/"); realEntry = entry.slice(0, s + 1) + "__nosheb_" + entry.slice(s + 1); fs.writeFileSync(realEntry, head.replace(/^#![^\n]*\n/, "//\n")); }
-    } catch {}
+    const realEntry = shebangStripped(fs, entry);
     const n = (globalThis.__SPAWN_N = (globalThis.__SPAWN_N || 0) + 1);
     const probePath = "/tmp/__spawn_probe_" + n + ".mjs";
     fs.writeFileSync(probePath, probeSrc(realEntry, args, options.cwd || "/tmp", options.env || {}));
@@ -256,9 +324,7 @@ export class NpmBaseImage {
     const root = "/tmp/proj";
     fs.mkdirSync(root, { recursive: true });
     fs.mkdirSync("/tmp/npmcache", { recursive: true });
-    const argv = ["node", "npm", "install", pkg, "--ignore-scripts", "--no-audit", "--no-fund",
-      "--no-update-notifier", "--legacy-peer-deps", "--cache=/tmp/npmcache",
-      "--registry=https://registry.npmjs.org/", "--userconfig=/tmp/.npmrc-u", "--globalconfig=/tmp/.npmrc-g"];
+    const argv = ["node", "npm", "install", pkg, ...NPM_CONFIG_FLAGS];
     const probePath = "/tmp/__npm_probe.mjs";
     fs.writeFileSync(probePath, `
       import { WorkerEntrypoint } from "cloudflare:workers";
@@ -303,15 +369,8 @@ export class NpmBaseImage {
     fs.mkdirSync(root, { recursive: true });
     fs.mkdirSync("/tmp/npmcache", { recursive: true });
     // shebang-strip npm-cli.js (workerd's loader rejects a leading #!); require the stripped copy.
-    const bin = "/tmp/usr/lib/node_modules/npm/bin/npm-cli.js";
-    let entry = bin;
-    try {
-      const head = fs.readFileSync(bin, "utf8");
-      if (head.startsWith("#!")) { entry = "/tmp/usr/lib/node_modules/npm/bin/__nosheb_npm-cli.js"; fs.writeFileSync(entry, head.replace(/^#![^\n]*\n/, "//\n")); }
-    } catch {}
-    const argv = ["node", "npm", "install", pkg, "--ignore-scripts", "--no-audit", "--no-fund",
-      "--no-update-notifier", "--legacy-peer-deps", "--cache=/tmp/npmcache",
-      "--registry=https://registry.npmjs.org/", "--userconfig=/tmp/.npmrc-u", "--globalconfig=/tmp/.npmrc-g"];
+    const entry = shebangStripped(fs, NPM_BIN);
+    const argv = ["node", "npm", "install", pkg, ...NPM_CONFIG_FLAGS];
     const outLog = "/tmp/__npm_bin_out.log";
     const probePath = "/tmp/__npm_bin_probe.mjs";
     fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, root, outLog));
@@ -408,13 +467,10 @@ export class NpmBaseImage {
   // Repin the scaffolded app's deps to the workerd-ready vite/rolldown fork, then run the
   // REAL `npm install` inside it — npm's programmatic entry, AWAITED in a child over the VFS
   // (same mechanism as npmInstall). After this the app's node_modules holds vite + rolldown.
-  async npmInstallApp(project = "myapp") {
-    const fs = nodeFs;
-    const target = "/tmp/proj/" + project;
-    if (!fs.existsSync(target + "/package.json")) throw new Error("no scaffold at " + target);
-    // Repin: vite -> the workerd fork, and add the rolldown fork (create-vite's react-ts
-    // template depends on a plain "vite", which won't run in workerd). sed-style rewrite of
-    // the real package.json the scaffold produced.
+  // Repin the scaffold's deps to the workerd-ready forks: vite -> @netanelgilad/vite, plus
+  // add the rolldown fork (create-vite's react-ts template depends on a plain "vite", which
+  // won't run in workerd). sed-style rewrite of the real package.json the scaffold produced.
+  repinScaffold(fs, target) {
     const pkg = JSON.parse(fs.readFileSync(target + "/package.json", "utf8"));
     pkg.devDependencies = pkg.devDependencies || {};
     pkg.dependencies = pkg.dependencies || {};
@@ -425,10 +481,15 @@ export class NpmBaseImage {
     else pkg.devDependencies.vite = VITE_FORK;
     pkg.devDependencies.rolldown = ROLLDOWN_FORK;
     fs.writeFileSync(target + "/package.json", JSON.stringify(pkg, null, 2) + "\n");
+  }
 
-    const argv = ["node", "npm", "install", "--ignore-scripts", "--no-audit", "--no-fund",
-      "--no-update-notifier", "--legacy-peer-deps", "--cache=/tmp/npmcache",
-      "--registry=https://registry.npmjs.org/", "--userconfig=/tmp/.npmrc-u", "--globalconfig=/tmp/.npmrc-g"];
+  async npmInstallApp(project = "myapp") {
+    const fs = nodeFs;
+    const target = "/tmp/proj/" + project;
+    if (!fs.existsSync(target + "/package.json")) throw new Error("no scaffold at " + target);
+    this.repinScaffold(fs, target);
+
+    const argv = ["node", "npm", "install", ...NPM_CONFIG_FLAGS];
     const probePath = "/tmp/__npm_install_app_probe.mjs";
     fs.writeFileSync(probePath, `
       import { WorkerEntrypoint } from "cloudflare:workers";
@@ -464,6 +525,75 @@ export class NpmBaseImage {
     let pkgJson = null; try { pkgJson = fs.readFileSync(target + "/package.json", "utf8"); } catch {}
     return { ms: Date.now() - t0, project, count: installed.length, hasVite, hasRolldown,
       installed: installed.sort(), pkgJson, run };
+  }
+
+  // ---- `npm create vite` via the LITERAL npm bin (recursive-process test) ---------------
+  // Same result as npmCreateVite, but npm is NOT driven programmatically: the drain child
+  // runs `node npm-cli.js create vite myapp -- --template react-ts --no-interactive`
+  // fire-and-forget (require + drainProcess = the process model), and npm's cmd-list maps
+  // create->init->libnpmexec INSIDE that process. This is the recursive-process test:
+  // process 1 (npm) spawns process 2 (create-vite) via the baked child_process shim ->
+  // __ISOLATE_SPAWN -> globalOutbound(SELF) -> the DO's /isolate-spawn -> LOADER sub-isolate.
+  // The spawn happens DURING the drain phase (after run() returned) — drainProcess keeps
+  // the IoContext bound, so the bridge fetch is expected to work there.
+  async npmCreateViteBin(project = "myapp", template = "react-ts") {
+    const fs = nodeFs;
+    const runPath = "/tmp/proj";
+    fs.mkdirSync(runPath, { recursive: true });
+    fs.mkdirSync("/tmp/npmcache", { recursive: true });
+    try { fs.rmSync(runPath + "/" + project, { recursive: true, force: true }); } catch {}
+    const entry = shebangStripped(fs, NPM_BIN);
+    // Literal CLI argv for `npm create vite myapp -- --template react-ts --no-interactive`:
+    // --yes answers libnpmexec's install-confirm prompt (init.js reads config.get('yes'));
+    // --script-shell=sh keeps promise-spawn on the sh -c path our spawn bridge tokenizes;
+    // --node-gyp pins the config default (workerd's CJS require has no require.resolve, and
+    // make-spawn-args falls back to require.resolve when the option is empty — the same
+    // accommodation the awaited flow makes by passing `nodeGyp` into libexec directly);
+    // args after `--` go verbatim to the create-vite bin.
+    const argv = ["node", "npm", "create", "vite", project, "--yes", "--script-shell=sh",
+      "--node-gyp=/tmp/usr/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js",
+      ...NPM_CONFIG_FLAGS, "--", "--template", template, "--no-interactive"];
+    const outLog = "/tmp/__npm_create_bin_out.log";
+    const probePath = "/tmp/__npm_create_bin_probe.mjs";
+    fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, runPath, outLog, true));
+    const t0 = Date.now();
+    const child = this.env.LOADER.get("npm-create-bin-runner", () => nodeProcessChildDrain(probePath, this.env.SELF));
+    const started = await child.getEntrypoint().run(); // waitpid: drain runs npm create incl. the spawn hop
+    const target = runPath + "/" + project;
+    // scaffold files were written by the create-vite sub-isolate; re-own for later writes.
+    try { this.reownTree(fs, target); } catch {}
+    let files = [];
+    try { files = walkDir(fs, target, target).sort(); } catch (e) { files = ["ERR " + String(e)]; }
+    let pkg = null; try { pkg = JSON.parse(fs.readFileSync(target + "/package.json", "utf8")); } catch {}
+    let output = ""; try { output = fs.readFileSync(outLog, "utf8"); } catch {}
+    return { ok: fs.existsSync(target + "/package.json"), ms: Date.now() - t0,
+      project, target, files, pkg, output, started };
+  }
+
+  // `npm install` inside the scaffold via the LITERAL bin (same repin as npmInstallApp, but
+  // the install is a fire-and-forget drain-child process instead of awaited npm.exec).
+  // No spawn bridge needed: --ignore-scripts means npm spawns nothing during install.
+  async npmInstallAppBin(project = "myapp") {
+    const fs = nodeFs;
+    const target = "/tmp/proj/" + project;
+    if (!fs.existsSync(target + "/package.json")) throw new Error("no scaffold at " + target);
+    this.repinScaffold(fs, target);
+    const entry = shebangStripped(fs, NPM_BIN);
+    const argv = ["node", "npm", "install", ...NPM_CONFIG_FLAGS];
+    const outLog = "/tmp/__npm_install_app_bin_out.log";
+    const probePath = "/tmp/__npm_install_app_bin_probe.mjs";
+    fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, target, outLog));
+    const t0 = Date.now();
+    const child = this.env.LOADER.get("npm-install-app-bin-runner", () => nodeProcessChildDrain(probePath));
+    const started = await child.getEntrypoint().run(); // waitpid
+    let installed = [];
+    try { installed = fs.readdirSync(target + "/node_modules").filter((n) => !n.startsWith(".")); } catch {}
+    const hasVite = installed.includes("vite");
+    const hasRolldown = installed.includes("rolldown");
+    let output = ""; try { output = fs.readFileSync(outLog, "utf8"); } catch {}
+    let pkgJson = null; try { pkgJson = fs.readFileSync(target + "/package.json", "utf8"); } catch {}
+    return { ms: Date.now() - t0, project, count: installed.length, hasVite, hasRolldown,
+      installed: installed.sort(), pkgJson, output, started };
   }
 
   async fetch(request) {
@@ -505,7 +635,20 @@ export class NpmBaseImage {
         const result = await this.npmInstallApp(project);
         return Response.json({ ok: result.hasVite && result.hasRolldown, op: "npm-install-app", result });
       }
-      return new Response("ops: /boot /npm-install?pkg= /npm-create?project=&template= /npm-install-app?project=", { status: 404 });
+      if (url.pathname === "/npm-create-bin") {
+        await this.boot();
+        const project = url.searchParams.get("project") || "myapp";
+        const template = url.searchParams.get("template") || "react-ts";
+        const result = await this.npmCreateViteBin(project, template);
+        return Response.json({ ok: result.ok, op: "npm-create-bin", result });
+      }
+      if (url.pathname === "/npm-install-app-bin") {
+        await this.boot();
+        const project = url.searchParams.get("project") || "myapp";
+        const result = await this.npmInstallAppBin(project);
+        return Response.json({ ok: result.hasVite && result.hasRolldown, op: "npm-install-app-bin", result });
+      }
+      return new Response("ops: /boot /npm-install?pkg= /npm-install-bin?pkg= /npm-create?project=&template= /npm-create-bin?project=&template= /npm-install-app?project= /npm-install-app-bin?project=", { status: 404 });
     } catch (e) {
       return Response.json({ ok: false, error: String(e), stack: (e?.stack ?? "").split("\n").slice(0, 30) }, { status: 500 });
     }
