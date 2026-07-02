@@ -632,6 +632,26 @@ export class Shell {
         }
       } catch {}
     }
+    // Re-root gap (native resolver VFS visibility): rolldown's browser WASI binding hardcodes
+    // `preopens: { '/tmp': '/tmp' }`, so the native oxc resolver (running inside the WASI
+    // sandbox) can only stat/open files under /tmp — every resolveId for a project at
+    // /root/proj returns null (root-relative URL, relative, and bare imports all fail), and vite
+    // serves raw untransformed source. node:fs sees the whole re-rooted VFS fine; only the WASI
+    // *preopen table* is the limit. The binding's own Node variant (rolldown-binding.wasi.cjs)
+    // already preopens the whole root (`path.parse(process.cwd()).root` -> "/"); we make the
+    // browser variant match by adding a "/" preopen (kept alongside "/tmp"; WASI uses the
+    // longest-prefix match, so /tmp paths are unaffected). This is the general fix for the
+    // native resolver on the re-rooted fork — config bundling hit the same wall.
+    {
+      const f = root + "/node_modules/rolldown/dist/rolldown-binding.wasi-browser.js";
+      try {
+        let src = fs.readFileSync(f, "utf8");
+        if (src.includes("'/tmp': '/tmp'") && !/['"]\/['"]\s*:\s*['"]\/['"]/.test(src)) {
+          src = src.replace("'/tmp': '/tmp',", "'/tmp': '/tmp',\n    '/': '/',");
+          fs.writeFileSync(f, src);
+        }
+      } catch {}
+    }
     // Resolve node_modules/vite's bin + shebang-strip (workerd's loader rejects a leading #!).
     const pkg = JSON.parse(fs.readFileSync(root + "/node_modules/vite/package.json", "utf8"));
     const rel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin.vite;

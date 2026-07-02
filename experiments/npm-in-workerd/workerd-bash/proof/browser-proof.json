@@ -1,0 +1,64 @@
+{
+  "_note": "playwright-core drove the SYSTEM Chromium (headless) against the LIVE vite dev server at http://127.0.0.1:5201 — the ToDo app served by the REAL vite bin (`npm run dev`) running in a workerd child isolate. Ran on ~/Development/workerd-vfs.bin (the fork's VFS re-rooted at `/`, POSIX open(), one shared disk) with the project at /root/proj. All assertions below passed against the real running app in a real browser; the .png screenshots were captured during the same run.",
+  "url": "http://127.0.0.1:5201",
+  "served_by": "REAL vite bin (`npm run dev`) in a Worker-Loader child over the DO's re-rooted native FS",
+  "binary": "~/Development/workerd-vfs.bin (re-rooted `/`, POSIX)",
+  "project_root": "/root/proj",
+  "browser": {
+    "engine": "chromium",
+    "executablePath": "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "headless": true
+  },
+  "initialRender": {
+    "mounted": true,
+    "h1": "ToDo"
+  },
+  "hmr": {
+    "edit": "sed s/ToDo/ToDo Live/ src/App.tsx",
+    "before": "ToDo",
+    "after": "ToDo Live",
+    "markerSurvived": true,
+    "fullReload": false
+  },
+  "screenshots": [
+    "proof-screenshots/initial.png",
+    "proof-screenshots/after-hmr.png"
+  ],
+  "assertions": [
+    {
+      "name": "dev server serves app HTML",
+      "ok": true,
+      "detail": "GET http://127.0.0.1:5201/ returned the app shell"
+    },
+    {
+      "name": "initial DOM rendered by React",
+      "ok": true,
+      "detail": "#root h1 present"
+    },
+    {
+      "name": "initial <h1> shows expected string",
+      "ok": true,
+      "detail": "h1 = \"ToDo\" (expected \"ToDo\")"
+    },
+    {
+      "name": "sed edit applied",
+      "ok": true,
+      "detail": "hmr flush: {\"dirty\":[\"/root/proj/src/App.tsx\"],\"devRoot\":\"/root/proj\",\"changed\":[\"/root/proj/src/App.tsx\"],\"results\":[{\"ok\":true,\"modsForFile\":2,\"bundledDev\":false,\"clients\":1,\"wsOut\":[],\"logs\":[\"ensureServing:start root=/root/proj bin=/root/proj/node_modules/vite/bin/__nosheb_vite.js\",\"rolldown booted\",\"startRealVite returned\",\"ensureServing:start root=/root/proj bin=/root/proj/node_modules/vite/bin/__nosheb_vite.js\",\"rolldown booted\",\"startRealVite returned\"]}]}"
+    },
+    {
+      "name": "live HMR updated <h1> in the DOM",
+      "ok": true,
+      "detail": "h1 = \"ToDo Live\" (was \"ToDo\")"
+    },
+    {
+      "name": "no full page reload (window marker survived)",
+      "ok": true,
+      "detail": "marker=alive-1783009171391"
+    },
+    {
+      "name": "no main-frame navigation fired during HMR",
+      "ok": true,
+      "detail": "navigations: 0 after edit"
+    }
+  ]
+}
