@@ -43,6 +43,20 @@ const SHIM = "/tmp/usr/lib/workerd-shims";
 //   node:process is not a registered builtin -> resolve fails. Fork follow-up: mirror the
 //   redirect in the CJS require path. (The bake's original motivation was a HOST-fallback
 //   CJS-loader segfault; that's gone — this resolution gap is what remains.)
+//
+// - @npmcli/agent: every registry request dies with
+//   `TypeError: Protocol "https:" not supported. Expected "http:"` (ERR_INVALID_PROTOCOL
+//   at node-internal:internal_http_client, via node:https:26 <- minipass-fetch <-
+//   make-fetch-happen). Root cause (probe-verified): workerd's internal_http_agent.ts
+//   declares `protocol` as a TS CLASS FIELD, so the constructor installs an OWN data
+//   property `protocol: 'http:'` on every Agent instance ([[Define]] semantics). That own
+//   property shadows agent-base's prototype get/set protocol pair — in real Node the
+//   constructor's `this.protocol = ...` is a [[Set]] that agent-base's setter deliberately
+//   swallows (this[INTERNAL] is still undefined during super()), keeping its stack-sniffing
+//   getter live. Under workerd `agent.protocol` is therefore always 'http:', and
+//   ClientRequest trusts agent.protocol over the https default -> throws. Fork follow-up:
+//   drop the class-field declarations for protocol/defaultPort in internal_http_agent.ts
+//   (assign via [[Set]] like Node) so subclass accessors intercept.
 const REDIRECTS = [
   ["node:process", `${SHIM}/process.cjs`], ["process", `${SHIM}/process.cjs`],
   ["@npmcli/agent", `${SHIM}/npmcli-agent.cjs`],
@@ -85,8 +99,11 @@ mkdirSync(NPM_DEST, { recursive: true });
 console.log("  baking npm ->", path.relative(HERE, NPM_DEST));
 copyAndBake(NPM_SRC, NPM_DEST);
 
+// Ship only the shims a REDIRECT actually points at (do-native-fs keeps the full set for
+// its own experiment; the image carries no vestigial files).
 mkdirSync(SHIMS_DEST, { recursive: true });
-for (const f of readdirSync(SHIMS_SRC)) cpSync(path.join(SHIMS_SRC, f), path.join(SHIMS_DEST, f));
+const shimFiles = new Set(REDIRECTS.map(([, target]) => path.posix.basename(target)));
+for (const f of shimFiles) cpSync(path.join(SHIMS_SRC, f), path.join(SHIMS_DEST, f));
 
 // /usr/bin launchers: import the real bin from the VFS by absolute path (the launcher's own
 // location is irrelevant; the real bin's relative requires resolve from /usr/lib/...).
