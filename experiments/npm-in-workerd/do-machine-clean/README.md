@@ -9,11 +9,16 @@ Worker-Loader **sub-isolate** that resolves its module graph from the DO's
 shared `/tmp` via the fork's C++ VFS module loader. The dev server is proxied
 out to a real port and a browser renders + drives the working ToDo app.
 
-There is **NO source-transform pass and NO runtime overlay**. Everything Vite
-needs is baked into the two published packages; the workerd fork supplies
-`import.meta.url` natively. The only host/child glue is the documented
-runtime-contract globals (`__UNSAFE_EVAL`, `__wasmCompile`, the rolldown WASI
-boot globals) — not a code rewrite.
+There is **NO source-transform pass and NO runtime overlay** on the Vite path:
+everything Vite needs is baked into the two published packages; the workerd
+fork supplies `import.meta.url` natively, and its C++ VFS loader serves module
+bytes verbatim. The only host/child glue is the documented runtime-contract
+globals (`__UNSAFE_EVAL`, `__wasmCompile`, the rolldown WASI boot globals) —
+not a code rewrite. (The `rewriteSource` in `host-do.mjs` is a different,
+narrower thing: it applies only to the **DO's own npm-engine modules** served
+through miniflare's fallback — the same Layer-2 machinery as the parent
+experiment — and never touches the child's Vite/Rolldown graph, which resolves
+from `/tmp` via the fork's loader and bypasses the fallback entirely.)
 
 ## What it proves (the whole loop, from public npm)
 
