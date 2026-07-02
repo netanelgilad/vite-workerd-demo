@@ -42,11 +42,14 @@ async function patchProcessReport() {
   for (const t of targets) { if (!t) continue; try { Object.defineProperty(t, "report", { configurable: true, value: stub }); } catch {} }
 }
 
-// ---- spawn bridge (proven; runs a JS entry from the VFS in a child as a "process") ----
+// ---- child configs (run a JS entry from the VFS in a sub-isolate as a "process") ----
+// allowSpawn (fork primitive): grants the child a spawn-loader channel so its NATIVE
+// node:child_process.spawn() can launch further sub-isolate processes — no JS plumbing;
+// spawned children get allowSpawn themselves, so processes spawn recursively.
 function nodeProcessChild(probePath) {
   return {
     compatibilityDate: CHILD_COMPAT_DATE, compatibilityFlags: CHILD_FLAGS, allowExperimental: true,
-    shareParentTmp: true, vfsModuleFallback: true, mainModule: "main.js",
+    shareParentTmp: true, vfsModuleFallback: true, allowSpawn: true, mainModule: "main.js",
     modules: { "main.js": `export { default } from ${JSON.stringify(probePath)};` },
   };
 }
@@ -54,13 +57,11 @@ function nodeProcessChild(probePath) {
 // The "node" shim: a sub-isolate that runs a bin as a supervised PROCESS. `drainProcess`
 // (workerd-fork primitive) runs the isolate to event-loop quiescence after run() returns;
 // the parent's `await child.run()` is waitpid. This is how we replace `node <script>`.
-// Optional selfFetcher (= the DO's SELF binding) becomes the child's globalOutbound so a
-// spawn bridge inside the child can fetch BACK to the DO's /isolate-spawn (npm create).
-function nodeProcessChildDrain(probePath, selfFetcher) {
+function nodeProcessChildDrain(probePath) {
   return {
     compatibilityDate: CHILD_COMPAT_DATE, compatibilityFlags: CHILD_FLAGS, allowExperimental: true,
-    shareParentTmp: true, vfsModuleFallback: true, drainProcess: true, mainModule: "main.js",
-    ...(selfFetcher ? { globalOutbound: selfFetcher } : {}),
+    shareParentTmp: true, vfsModuleFallback: true, drainProcess: true, allowSpawn: true,
+    mainModule: "main.js",
     modules: { "main.js": `export { default } from ${JSON.stringify(probePath)};` },
   };
 }
@@ -77,29 +78,19 @@ function nodeProcessChildDrain(probePath, selfFetcher) {
 // small installs by riding incidental timers. Until the fork counts I/O as work, the probe
 // emulates node's active-handle refcount: a timer chain keeps the process alive until the
 // bin calls process.exit (npm's exit-handler always does) or a hard deadline passes.
+// STOPGAP: delete this keepalive once the fork's I/O-quiescence fix (in-flight socket/HTTP
+// counted as pending work) lands — it's being built in parallel.
 //
-// withSpawnBridge (used by `npm create` via the literal bin): install __ISOLATE_SPAWN so
-// npm's baked child_process shim can spawn create-vite — the fetch goes over the child's
-// globalOutbound (= the DO's SELF Fetcher) back to /isolate-spawn. Critically, npm calls
-// spawn AFTER run() returns, i.e. DURING the drain phase — drainProcess keeps the
-// IoContext bound so the fetch still works; any failure is appended to the log verbatim.
-// Also sets env.PATH (so @npmcli/run-script's setPATH has a PATH key to prepend the npx
-// .bin dirs to — workerd's process.env has none) and stubs process.report (the
-// npm-install-checks libc probe segfaults workerd; same guard as the libnpmexec child).
-function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnBridge = false) {
-  const bridge = !withSpawnBridge ? "" : `
-      globalThis.__ISOLATE_SPAWN = async (file, args, options = {}) => {
-        try {
-          const r = await fetch("http://self/isolate-spawn", {
-            method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ file, args, options: { cwd: options.cwd, env: options.env } }),
-          });
-          return await r.json();
-        } catch (e) {
-          append("[__ISOLATE_SPAWN failed during drain] " + (e && e.stack || e) + "\\n");
-          return { code: 1, signal: null, stdout: "", stderr: "isolate-spawn bridge failed: " + String(e) };
-        }
-      };
+// withSpawnEnv (used by `npm create` via the literal bin): npm spawns create-vite through
+// workerd's NATIVE child_process.spawn (the child config carries allowSpawn) — no bridge,
+// no fetch relay. Critically, npm calls spawn AFTER run() returns, i.e. DURING the drain
+// phase — the fork's spawnBegin/spawnEnd waitpid bracket keeps the drain alive across it.
+// The probe still sets env.PATH (so @npmcli/run-script's setPATH has a PATH key to prepend
+// the npx .bin dirs to — workerd's process.env has none; native spawn resolves bins over
+// that PATH) and stubs process.report (the npm-install-checks libc probe segfaults
+// workerd; same guard as the libnpmexec child).
+function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnEnv = false) {
+  const spawnEnv = !withSpawnEnv ? "" : `
       const reportStub = { excludeNetwork: true, getReport: () => ({ header: {}, sharedObjects: [] }) };`;
   return `
   import { WorkerEntrypoint } from "cloudflare:workers";
@@ -116,7 +107,7 @@ function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnBridge = false) 
       try { globalThis.addEventListener("unhandledrejection", logReason("unhandledrejection")); } catch {}
       try { globalThis.addEventListener("error", logReason("uncaught error")); } catch {}
       try { np.default.on && np.default.on("unhandledRejection", logReason("process unhandledRejection")); } catch {}
-      try { np.default.on && np.default.on("uncaughtException", logReason("process uncaughtException")); } catch {}${bridge}
+      try { np.default.on && np.default.on("uncaughtException", logReason("process uncaughtException")); } catch {}${spawnEnv}
       let exitCode = null;
       const exitFn = (c) => { if (exitCode === null) { exitCode = c == null ? 0 : c; append("[process exited code=" + exitCode + "]\\n"); } };
       for (const p of new Set([np.default, np, globalThis.process].filter(Boolean))) {
@@ -124,7 +115,7 @@ function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnBridge = false) 
         try { p.cwd = () => ${JSON.stringify(cwd)}; } catch { try { Object.defineProperty(p, "cwd", { configurable: true, value: () => ${JSON.stringify(cwd)} }); } catch {} }
         try { if (p.stdin) p.stdin.isTTY = false; } catch {}
         try { p.exit = exitFn; } catch {}
-        ${withSpawnBridge ? `try { p.env = Object.assign(p.env || {}, { PATH: "/usr/bin:/bin", HOME: "/tmp" }); } catch {}
+        ${withSpawnEnv ? `try { p.env = Object.assign(p.env || {}, { PATH: "/usr/bin:/bin", HOME: "/tmp" }); } catch {}
         try { Object.defineProperty(p, "report", { configurable: true, value: reportStub }); } catch {}` : ""}
       }
       // honor write(chunk, [enc], cb) callbacks — npm's exit-handler flushes stdout/stderr
@@ -144,18 +135,20 @@ function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnBridge = false) 
   }`;
 }
 // The libnpmexec child: runs npm's REAL `npm exec` engine FROM THE VFS (vfsModuleFallback).
-// globalOutbound = the DO's SELF Fetcher, so the child's __ISOLATE_SPAWN can fetch back to
-// the DO's /isolate-spawn to run the create-vite bin (the child has no LOADER of its own).
-function libnpmexecChild(probePath, selfFetcher) {
+// allowSpawn lets npm's require('child_process').spawn — now workerd's NATIVE module —
+// launch the create-vite bin as a sub-isolate process directly; outbound is inherited from
+// the DO (registry HTTPS goes straight to the network, no relay).
+function libnpmexecChild(probePath) {
   return {
     compatibilityDate: CHILD_COMPAT_DATE, compatibilityFlags: CHILD_FLAGS, allowExperimental: true,
-    shareParentTmp: true, vfsModuleFallback: true, globalOutbound: selfFetcher, mainModule: "main.js",
+    shareParentTmp: true, vfsModuleFallback: true, allowSpawn: true, mainModule: "main.js",
     modules: { "main.js": `export { default } from ${JSON.stringify(probePath)};` },
   };
 }
 
-// The probe that runs inside the libnpmexec child: install __ISOLATE_SPAWN (fetch back to the
-// DO), patch process.report (libc probe segfault guard), then await libnpmexec UNMODIFIED.
+// The probe that runs inside the libnpmexec child: patch process.report (libc probe
+// segfault guard), then await libnpmexec UNMODIFIED — its spawn of the create-vite bin
+// goes through workerd's native child_process.spawn.
 function libnpmexecProbeSrc(libexecEntry, opts) {
   return `
   import { WorkerEntrypoint } from "cloudflare:workers";
@@ -163,17 +156,6 @@ function libnpmexecProbeSrc(libexecEntry, opts) {
     async run() {
       const out = [], err = [];
       const np = await import("node:process");
-      // The baked child_process shim calls globalThis.__ISOLATE_SPAWN(file,args,opts). We send
-      // it to the DO over globalOutbound (plain fetch is routed to env.SELF) and return the
-      // {code,stdout,stderr} the shim turns back into a ChildProcess.
-      globalThis.__ISOLATE_SPAWN = async (file, args, options = {}) => {
-        const safeOpts = { cwd: options.cwd, env: options.env };
-        const r = await fetch("http://self/isolate-spawn", {
-          method: "POST", headers: { "content-type": "application/json" },
-          body: JSON.stringify({ file, args, options: safeOpts }),
-        });
-        return await r.json();
-      };
       // process.report.getReport() (npm-install-checks libc probe) segfaults workerd -> stub.
       const stub = { excludeNetwork: true, getReport: () => ({ header: {}, sharedObjects: [] }) };
       for (const t of new Set([np.default, np, globalThis.process].filter(Boolean))) {
@@ -199,81 +181,6 @@ function libnpmexecProbeSrc(libexecEntry, opts) {
   }`;
 }
 
-function tokenize(line) {
-  const out = []; let cur = "", q = null, has = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (q) { if (ch === q) q = null; else if (q === '"' && ch === "\\" && i + 1 < line.length) cur += line[++i]; else cur += ch; }
-    else if (ch === "'" || ch === '"') { q = ch; has = true; }
-    else if (ch === "\\" && i + 1 < line.length) { cur += line[++i]; has = true; }
-    else if (ch === " " || ch === "\t" || ch === "\n") { if (has || cur) { out.push(cur); cur = ""; has = false; } }
-    else { cur += ch; has = true; }
-  }
-  if (has || cur) out.push(cur);
-  return out;
-}
-function resolveArgv(file, args = []) {
-  const base = String(file || "").split("/").pop();
-  if ((base === "sh" || base === "bash" || base === "zsh") && args[0] === "-c") return tokenize(args[1] || "");
-  return [file, ...args];
-}
-function realOrSelf(fs, p) { try { return fs.realpathSync(p); } catch { return p; } }
-function scanNmForBin(fs, nm, cmd) {
-  let names = []; try { names = fs.readdirSync(nm); } catch { return null; }
-  const dirs = [];
-  for (const n of names) { if (n.startsWith("@")) { try { for (const s of fs.readdirSync(nm + "/" + n)) dirs.push(n + "/" + s); } catch {} } else dirs.push(n); }
-  for (const d of dirs) {
-    let pkg; try { pkg = JSON.parse(fs.readFileSync(nm + "/" + d + "/package.json", "utf8")); } catch { continue; }
-    const bin = pkg.bin, short = String(pkg.name || "").split("/").pop();
-    if (typeof bin === "string" && (pkg.name === cmd || short === cmd)) return nm + "/" + d + "/" + bin.replace(/^\.\//, "");
-    if (bin && typeof bin === "object" && bin[cmd]) return nm + "/" + d + "/" + String(bin[cmd]).replace(/^\.\//, "");
-  }
-  return null;
-}
-function resolveBinToJs(fs, cmd, options) {
-  if (cmd.startsWith("/") && fs.existsSync(cmd)) return realOrSelf(fs, cmd);
-  const dirs = String((options.env || {}).PATH || "").split(":").filter(Boolean);
-  for (const dir of dirs) { const cand = dir + "/" + cmd; try { if (fs.existsSync(cand)) return realOrSelf(fs, cand); } catch {} }
-  for (const dir of dirs) { if (dir.endsWith("/.bin")) { const hit = scanNmForBin(fs, dir.slice(0, -5), cmd); if (hit) return hit; } }
-  return null;
-}
-function probeSrc(entry, args, cwd, envObj) {
-  return `
-  import { WorkerEntrypoint } from "cloudflare:workers";
-  export default class extends WorkerEntrypoint {
-    async run() {
-      const ENTRY = ${JSON.stringify(entry)};
-      const ARGV = ${JSON.stringify(["node", entry, ...args])};
-      const CWD = ${JSON.stringify(cwd)};
-      const ENV = ${JSON.stringify(envObj)};
-      const out = [], err = [];
-      const now = () => Date.now(); let last = now();
-      const np = await import("node:process");
-      for (const proc of new Set([np.default, np, globalThis.process].filter(Boolean))) {
-        try { proc.argv = ARGV.slice(); } catch {}
-        try { proc.cwd = () => CWD; } catch { try { Object.defineProperty(proc, "cwd", { configurable: true, value: () => CWD }); } catch {} }
-        try { proc.env = Object.assign(proc.env || {}, ENV); } catch {}
-        try { if (proc.stdin) proc.stdin.isTTY = false; } catch {}
-      }
-      let exitCode = null;
-      try { np.default.exit = (c) => { exitCode = (c == null ? 0 : c); throw { __ISOLATE_EXIT__: exitCode }; }; } catch {}
-      const enc = (a) => a.map((x) => typeof x === "string" ? x : (() => { try { return JSON.stringify(x); } catch { return String(x); } })()).join(" ");
-      console.log = (...a) => { last = now(); out.push(enc(a) + "\\n"); };
-      console.info = (...a) => { last = now(); out.push(enc(a) + "\\n"); };
-      console.warn = (...a) => { last = now(); err.push(enc(a) + "\\n"); };
-      console.error = (...a) => { last = now(); err.push(enc(a) + "\\n"); };
-      try { np.default.stdout.write = (s) => { last = now(); out.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
-      try { np.default.stderr.write = (s) => { last = now(); err.push(typeof s === "string" ? s : String(s)); return true; }; } catch {}
-      let importErr = null;
-      last = now();
-      try { await import(ENTRY); }
-      catch (e) { if (e && typeof e === "object" && "__ISOLATE_EXIT__" in e) exitCode = e.__ISOLATE_EXIT__; else importErr = String(e && e.stack || e); }
-      const QUIET = 1500, MAX = 240000, t0 = now();
-      while (exitCode === null && (now() - t0) < MAX) { if (now() - last > QUIET) break; await new Promise((r) => setTimeout(r, 100)); }
-      return { code: exitCode == null ? 0 : exitCode, signal: null, stdout: out.join(""), stderr: err.join(""), importErr };
-    }
-  }`;
-}
 function walkDir(fs, dir, base) {
   const out = [];
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -301,18 +208,6 @@ export class NpmBaseImage {
       files++;
     }
     return { ok: true, files, npm: fs.existsSync(NPM_BIN) };
-  }
-
-  // Run a resolved JS bin entry in a sub-isolate as a "process" (shared /tmp). Used by
-  // isolateSpawn() to launch the create-vite bin the libnpmexec child asked us to spawn.
-  async runNodeChild(entry, args, options) {
-    const fs = nodeFs;
-    const realEntry = shebangStripped(fs, entry);
-    const n = (globalThis.__SPAWN_N = (globalThis.__SPAWN_N || 0) + 1);
-    const probePath = "/tmp/__spawn_probe_" + n + ".mjs";
-    fs.writeFileSync(probePath, probeSrc(realEntry, args, options.cwd || "/tmp", options.env || {}));
-    const child = this.env.LOADER.get("base-image-spawn-" + n, () => nodeProcessChild(probePath));
-    return await child.getEntrypoint().run();
   }
 
   // Run the REAL npm install command from the VFS in a child — npm's own programmatic entry
@@ -391,13 +286,11 @@ export class NpmBaseImage {
   // cache (Arborist + pacote over the VFS), then spawns the real create-vite bin.
   //
   // Isolate layout (3 levels, all sharing the DO's native /tmp via shareParentTmp):
-  //   DO (this isolate)  -- holds env.LOADER + env.SELF; serves /isolate-spawn
-  //     └─ libnpmexec child (vfsModuleFallback)  -- runs npm's exec engine FROM THE VFS.
-  //        Its baked child_process shim calls globalThis.__ISOLATE_SPAWN, which we wire to
-  //        fetch BACK to the DO's /isolate-spawn (the child has no LOADER of its own — a
-  //        WorkerLoader binding can't be passed into a child, but a Fetcher can, so the
-  //        child's globalOutbound = env.SELF routes its fetch back into the DO).
-  //          └─ create-vite sub-isolate  -- the DO spawns the REAL create-vite bin here.
+  //   DO (this isolate)  -- holds env.LOADER
+  //     └─ libnpmexec child (vfsModuleFallback, allowSpawn)  -- runs npm's exec engine FROM
+  //        THE VFS. Its require('child_process') is workerd's NATIVE module; spawn() uses
+  //        the child's own spawn-loader channel (granted by allowSpawn) — no DO round-trip.
+  //          └─ create-vite sub-isolate  -- native spawn launches the REAL create-vite bin.
   //
   // The DO cannot itself import VFS modules (vfsModuleFallback is a child-only flag and the
   // DO has no module-fallback service), which is why libnpmexec runs one level down.
@@ -423,7 +316,7 @@ export class NpmBaseImage {
     };
     const probePath = "/tmp/__libnpmexec_probe.mjs";
     fs.writeFileSync(probePath, libnpmexecProbeSrc(NPM_NM + "/libnpmexec/lib/index.js", opts));
-    const child = this.env.LOADER.get("libnpmexec-create", () => libnpmexecChild(probePath, this.env.SELF));
+    const child = this.env.LOADER.get("libnpmexec-create", () => libnpmexecChild(probePath));
     const run = await child.getEntrypoint().run();
     const target = runPath + "/" + project;
     // create-vite's files were written by the create-vite sub-isolate; re-own them from THIS
@@ -437,19 +330,6 @@ export class NpmBaseImage {
       ms: Date.now() - t0,
       project, target, files, pkg, run,
     };
-  }
-
-  // Service handler the libnpmexec child fetches (via its globalOutbound = env.SELF) when its
-  // child_process shim spawns the create-vite bin. The DO resolves the bin to a JS entry over
-  // the shared VFS and runs it in a sub-isolate, returning the captured stdout/stderr/code —
-  // exactly the contract @npmcli/promise-spawn expects from a spawned process.
-  async isolateSpawn(payload) {
-    const fs = nodeFs;
-    const { file, args = [], options = {} } = payload;
-    const argv = resolveArgv(file, args);
-    const entry = resolveBinToJs(fs, argv[0], options);
-    if (!entry) return { code: 127, signal: null, stdout: "", stderr: "isolate-spawn: cannot resolve '" + argv[0] + "' (PATH=" + (options.env?.PATH || "") + ")\n" };
-    return await this.runNodeChild(entry, argv.slice(1), options);
   }
 
   // Re-materialize every file under dir from THIS isolate. Files created by a spawn
@@ -532,10 +412,11 @@ export class NpmBaseImage {
   // runs `node npm-cli.js create vite myapp -- --template react-ts --no-interactive`
   // fire-and-forget (require + drainProcess = the process model), and npm's cmd-list maps
   // create->init->libnpmexec INSIDE that process. This is the recursive-process test:
-  // process 1 (npm) spawns process 2 (create-vite) via the baked child_process shim ->
-  // __ISOLATE_SPAWN -> globalOutbound(SELF) -> the DO's /isolate-spawn -> LOADER sub-isolate.
-  // The spawn happens DURING the drain phase (after run() returned) — drainProcess keeps
-  // the IoContext bound, so the bridge fetch is expected to work there.
+  // process 1 (npm) spawns process 2 (create-vite) via workerd's NATIVE
+  // child_process.spawn — the drain child carries allowSpawn, so the fork resolves the bin
+  // over the shared VFS and runs it as a further drainProcess sub-isolate, no JS plumbing.
+  // The spawn happens DURING the drain phase (after run() returned) — the fork's
+  // spawnBegin/spawnEnd waitpid bracket keeps the drain alive across it.
   async npmCreateViteBin(project = "myapp", template = "react-ts") {
     const fs = nodeFs;
     const runPath = "/tmp/proj";
@@ -545,7 +426,7 @@ export class NpmBaseImage {
     const entry = shebangStripped(fs, NPM_BIN);
     // Literal CLI argv for `npm create vite myapp -- --template react-ts --no-interactive`:
     // --yes answers libnpmexec's install-confirm prompt (init.js reads config.get('yes'));
-    // --script-shell=sh keeps promise-spawn on the sh -c path our spawn bridge tokenizes;
+    // --script-shell=sh keeps promise-spawn on the sh -c path native spawn tokenizes;
     // --node-gyp pins the config default (workerd's CJS require has no require.resolve, and
     // make-spawn-args falls back to require.resolve when the option is empty — the same
     // accommodation the awaited flow makes by passing `nodeGyp` into libexec directly);
@@ -557,7 +438,7 @@ export class NpmBaseImage {
     const probePath = "/tmp/__npm_create_bin_probe.mjs";
     fs.writeFileSync(probePath, drainBinProbeSrc(entry, argv, runPath, outLog, true));
     const t0 = Date.now();
-    const child = this.env.LOADER.get("npm-create-bin-runner", () => nodeProcessChildDrain(probePath, this.env.SELF));
+    const child = this.env.LOADER.get("npm-create-bin-runner", () => nodeProcessChildDrain(probePath));
     const started = await child.getEntrypoint().run(); // waitpid: drain runs npm create incl. the spawn hop
     const target = runPath + "/" + project;
     // scaffold files were written by the create-vite sub-isolate; re-own for later writes.
@@ -572,7 +453,7 @@ export class NpmBaseImage {
 
   // `npm install` inside the scaffold via the LITERAL bin (same repin as npmInstallApp, but
   // the install is a fire-and-forget drain-child process instead of awaited npm.exec).
-  // No spawn bridge needed: --ignore-scripts means npm spawns nothing during install.
+  // No spawn happens here: --ignore-scripts means npm spawns nothing during install.
   async npmInstallAppBin(project = "myapp") {
     const fs = nodeFs;
     const target = "/tmp/proj/" + project;
@@ -601,15 +482,8 @@ export class NpmBaseImage {
     await patchProcessReport();
     const url = new URL(request.url);
     try {
-      // The libnpmexec child routes ALL its outbound fetch through globalOutbound (= this
-      // worker). The internal spawn hop is http://self/isolate-spawn; everything else is a
-      // real npm registry request -> pass it straight through to the network so Arborist/
-      // pacote can fetch create-vite + its packuments.
-      if (url.hostname === "self" && url.pathname === "/isolate-spawn") {
-        const payload = await request.json();
-        return Response.json(await this.isolateSpawn(payload));
-      }
-      if (url.hostname !== "do.local" && url.hostname !== "self") return fetch(request);
+      // Children inherit the DO's global outbound (registry HTTPS goes straight to the
+      // network) and spawn natively via allowSpawn — no relay routes here.
       if (url.pathname === "/boot") return Response.json(await this.boot());
       if (url.pathname === "/npm-install") {
         await this.boot();

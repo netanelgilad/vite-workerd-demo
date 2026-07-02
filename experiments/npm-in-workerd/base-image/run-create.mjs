@@ -4,8 +4,8 @@
 //   1. /boot               extract the workerd-ready rootfs (npm) into the DO's native /tmp
 //   2. /npm-create         REAL `npm create vite myapp -- --template react-ts` — npm's own
 //                          libnpmexec (from the VFS) installs create-vite into the npx cache
-//                          and runs the genuine create-vite bin in a sub-isolate via the
-//                          child_process->isolate spawn bridge -> a real react-ts scaffold.
+//                          and runs the genuine create-vite bin in a sub-isolate via
+//                          workerd's NATIVE child_process.spawn -> a real react-ts scaffold.
 //   3. /npm-install-app    repin vite->@netanelgilad/vite fork (+ add rolldown fork), then
 //                          REAL `npm install` inside myapp -> node_modules has vite+rolldown.
 //
@@ -16,7 +16,7 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Log, LogLevel, Miniflare, Response as MfResponse, kCurrentWorker } from "miniflare";
+import { Log, LogLevel, Miniflare, Response as MfResponse } from "miniflare";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..");
@@ -53,9 +53,7 @@ const mf = new Miniflare({
   compatibilityDate: "2026-06-01",
   compatibilityFlags: ["nodejs_compat", "experimental"],
   unsafeEvalBinding: "UNSAFE_EVAL",
-  // HOST = image manifest; SELF = a Fetcher routed back into this worker (-> the DO), passed
-  // as the libnpmexec child's globalOutbound so its spawn bridge can call /isolate-spawn.
-  serviceBindings: { HOST: hostService, SELF: kCurrentWorker },
+  serviceBindings: { HOST: hostService },
   durableObjects: { RUNNER: "NpmBaseImage" },
   workerLoaders: { LOADER: {} },
 });

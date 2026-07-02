@@ -6,7 +6,7 @@
 //
 // Layout produced:
 //   usr/lib/node_modules/npm/      seed npm 11 (+ bundled deps), baked
-//   usr/lib/workerd-shims/         v8 / process / child_process / @npmcli/agent shims
+//   usr/lib/workerd-shims/         process / @npmcli/agent shims (still-baked redirects)
 //   usr/bin/npm, usr/bin/npx       launchers (import the absolute bin from the VFS)
 //   etc/npmrc                      registry / cache / ignore-scripts defaults
 //
@@ -30,14 +30,12 @@ const SHIMS_DEST = path.join(STAGING, "usr/lib/workerd-shims");
 const SHIM = "/tmp/usr/lib/workerd-shims";
 // Specifier redirects baked into npm so the child loader resolves workerd-ready builtins.
 // (import.meta.url is NOT baked — the fork supplies it natively for VFS modules.)
-// Shrinking toward vanilla npm: v8 (heap_size_limit) and the pacote async-tar-write bug are
-// now fixed in the workerd fork (feat/vfs-module-loading: node:v8 getHeapStatistics +
-// fs async write callbacks), so those bakes are GONE. Remaining redirects map to fork
-// primitives not yet promoted: process (CJS-loader segfault), child_process (spawn→isolate
-// bridge), @npmcli/agent (https keepalive).
+// Shrinking toward vanilla npm: v8 (heap_size_limit), the pacote async-tar-write bug, and
+// child_process (native spawn = sub-isolate, fork commits b5ec2a0/b20ee30) are now fork
+// primitives, so those bakes are GONE. Remaining redirects map to fork primitives not yet
+// promoted: process (CJS-loader segfault), @npmcli/agent (https keepalive).
 const REDIRECTS = [
   ["node:process", `${SHIM}/process.cjs`], ["process", `${SHIM}/process.cjs`],
-  ["node:child_process", `${SHIM}/child_process.cjs`], ["child_process", `${SHIM}/child_process.cjs`],
   ["@npmcli/agent", `${SHIM}/npmcli-agent.cjs`],
 ];
 const importSite = (spec) =>

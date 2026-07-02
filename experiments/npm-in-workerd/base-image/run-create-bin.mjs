@@ -5,9 +5,9 @@
 //   1. /boot                 extract the workerd-ready rootfs (npm) into the DO's /tmp
 //   2. /npm-create-bin       LITERAL `node npm-cli.js create vite myapp -- --template
 //                            react-ts` in a drainProcess child. npm (process 1) spawns
-//                            create-vite (process 2) DURING the drain via the baked
-//                            child_process shim -> __ISOLATE_SPAWN -> globalOutbound(SELF)
-//                            -> the DO's /isolate-spawn -> LOADER sub-isolate.
+//                            create-vite (process 2) DURING the drain via workerd's NATIVE
+//                            child_process.spawn (allowSpawn -> recursive sub-isolate
+//                            processes, no JS plumbing).
 //   3. /npm-install-app-bin  repin vite->fork (+ rolldown fork), then LITERAL
 //                            `node npm-cli.js install` (drainProcess child, cwd=myapp)
 //                            -> node_modules has vite + rolldown.
@@ -18,7 +18,7 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { Log, LogLevel, Miniflare, Response as MfResponse, kCurrentWorker } from "miniflare";
+import { Log, LogLevel, Miniflare, Response as MfResponse } from "miniflare";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, "..");
@@ -55,9 +55,7 @@ const mf = new Miniflare({
   compatibilityDate: "2026-06-01",
   compatibilityFlags: ["nodejs_compat", "experimental"],
   unsafeEvalBinding: "UNSAFE_EVAL",
-  // HOST = image manifest; SELF = a Fetcher routed back into this worker (-> the DO), used
-  // as the drain child's globalOutbound so its spawn bridge can call /isolate-spawn.
-  serviceBindings: { HOST: hostService, SELF: kCurrentWorker },
+  serviceBindings: { HOST: hostService },
   durableObjects: { RUNNER: "NpmBaseImage" },
   workerLoaders: { LOADER: {} },
 });
