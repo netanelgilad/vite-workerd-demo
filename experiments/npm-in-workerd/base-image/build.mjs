@@ -30,10 +30,12 @@ const SHIMS_DEST = path.join(STAGING, "usr/lib/workerd-shims");
 const SHIM = "/tmp/usr/lib/workerd-shims";
 // Specifier redirects baked into npm so the child loader resolves workerd-ready builtins.
 // (import.meta.url is NOT baked — the fork supplies it natively for VFS modules.)
-// Shrinking toward vanilla npm: v8 (heap_size_limit), the pacote async-tar-write bug, and
-// child_process (native spawn = sub-isolate, fork commits b5ec2a0/b20ee30) are now fork
-// primitives, so those bakes are GONE. Each remaining redirect = a named fork gap,
-// re-verified empirically on workerd-spawn.bin (delete the bake, rebake, run all flows):
+// Shrinking toward vanilla npm: v8 (heap_size_limit), the pacote async-tar-write bug,
+// child_process (native spawn = sub-isolate, fork commits b5ec2a0/b20ee30), and
+// require.resolve (native CJS resolution — relative/absolute/bare via the VFS node_modules
+// walk + package.json main, plus createRequire(...).resolve) are now fork primitives, so
+// those bakes are GONE. Each remaining redirect = a named fork gap, re-verified empirically
+// on the fork binary (delete the bake, rebake, run all flows):
 //
 // - process: CJS `require('node:process')` from a VFS module throws
 //   `No such module "node:process".` (first hit: npm-install-checks/lib/current-env.js:1,
@@ -64,15 +66,8 @@ const REDIRECTS = [
 const importSite = (spec) =>
   new RegExp(String.raw`(\bfrom\s*|\bimport\s*\(\s*|\b__require\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)(["'])${spec.replace(/[/\\]/g, "\\$&")}\2`, "gm");
 
-function bake(src, virtPath) {
+function bake(src) {
   for (const [spec, target] of REDIRECTS) src = src.replace(importSite(spec), (m, lead, q) => `${lead}${q}${target}${q}`);
-  // workerd's CJS require has no .resolve — bake relative require.resolve('./x') calls into
-  // the absolute VFS path they'd resolve to (e.g. init-package-json's module-level
-  // require.resolve('./default-input.js'), hit by `npm create` when it loads commands/init).
-  // Non-relative sites are left alone (they're try/caught or covered by config flags).
-  const virtDir = path.posix.dirname(virtPath);
-  src = src.replace(/\brequire\.resolve\(\s*(['"])(\.{1,2}\/[^'"]+)\1\s*\)/g,
-    (m, q, rel) => JSON.stringify(path.posix.normalize(`${virtDir}/${rel}`)));
   return src;
 }
 
@@ -84,8 +79,7 @@ function copyAndBake(srcDir, destDir) {
     if (e.isDirectory()) copyAndBake(s, d);
     else if (e.isFile()) {
       if (/\.(js|cjs|mjs)$/.test(e.name)) {
-        const virt = "/tmp/usr/lib/node_modules/npm" + s.slice(NPM_SRC.length);
-        writeFileSync(d, bake(readFileSync(s, "utf8"), virt));
+        writeFileSync(d, bake(readFileSync(s, "utf8")));
       } else {
         cpSync(s, d);
       }

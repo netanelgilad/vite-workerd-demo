@@ -70,16 +70,9 @@ function nodeProcessChildDrain(probePath) {
 // is synchronous + in-context (dynamic import()'s microtask checkpoint would drop the
 // IoContext -> "global scope" error). Output is appended to a VFS log the DO reads after
 // the process exits (run() returns a snapshot BEFORE drainProcess runs npm's async work).
-//
-// KEEPALIVE (fork-primitive gap, measured): drainProcess's quiescence check counts pending
-// TIMERS but NOT in-flight socket/HTTP I/O. A drain whose only remaining work is a network
-// read ends immediately (a bare https.get dies ~20ms into the drain; the same 15 MB
-// packument body streams fully in ~1.6s if any timer chain is live). npm only survived
-// small installs by riding incidental timers. Until the fork counts I/O as work, the probe
-// emulates node's active-handle refcount: a timer chain keeps the process alive until the
-// bin calls process.exit (npm's exit-handler always does) or a hard deadline passes.
-// STOPGAP: delete this keepalive once the fork's I/O-quiescence fix (in-flight socket/HTTP
-// counted as pending work) lands — it's being built in parallel.
+// drainProcess now runs the sub-isolate to TRUE event-loop quiescence, counting in-flight
+// socket/HTTP I/O as pending work (the Node active-requests analog) — so the fire-and-forget
+// bin exits exactly when node/bun/deno would, no keepalive needed.
 //
 // withSpawnEnv (used by `npm create` via the literal bin): npm spawns create-vite through
 // workerd's NATIVE child_process.spawn (the child config carries allowSpawn) — no bridge,
@@ -123,11 +116,6 @@ function drainBinProbeSrc(binEntry, argv, cwd, outLog, withSpawnEnv = false) {
       const writeFn = (s, enc, cb) => { append(s); const f = typeof enc === "function" ? enc : cb; if (typeof f === "function") queueMicrotask(f); return true; };
       try { np.default.stdout.write = writeFn; } catch {}
       try { np.default.stderr.write = writeFn; } catch {}
-      // active-handle keepalive: sustain the drain (timers count as work, sockets don't)
-      // until the bin exits; the chain then stops and the drain reaches quiescence.
-      const DEADLINE = Date.now() + 240000;
-      const keepalive = () => { if (exitCode === null && Date.now() < DEADLINE) setTimeout(keepalive, 200); };
-      setTimeout(keepalive, 200);
       const require = mod.createRequire(${JSON.stringify(cwd + "/x.js")});
       try { require(${JSON.stringify(binEntry)}); } catch (e) { append("[require threw] " + (e && e.stack || e) + "\\n"); }
       return { started: true };
